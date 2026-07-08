@@ -558,12 +558,18 @@ const ATMO_FRAG = `
 #include <logdepthbuf_pars_fragment>
 uniform vec3 uColor;
 uniform vec3 uSunPos;
+uniform vec3 uCenter;
+uniform float uShellR;
 uniform float uPower;
 uniform float uIntensity;
 varying vec3 vNormal;
 varying vec3 vWorldPos;
 void main(){
   vec3 viewDir = normalize(cameraPosition - vWorldPos);
+  // the glow shell must never read as a glass force-field: fade it out
+  // as the camera approaches / enters it (full strength only from afar)
+  float camFade = smoothstep(uShellR * 1.02, uShellR * 1.55,
+                             distance(cameraPosition, uCenter));
   vec3 sunDir  = normalize(uSunPos - vWorldPos);
   float rim = pow(clamp(dot(viewDir, vNormal) + 1.05, 0.0, 1.05), uPower);
   float day = clamp(dot(-vNormal, sunDir) * 0.6 + 0.5, 0.05, 1.0);
@@ -573,7 +579,7 @@ void main(){
   vec3 rimCol = mix(uColor, vec3(1.0), pow(rim, 3.0) * 0.4);
   vec3 col = rimCol * rim * day * uIntensity * 1.35
            + vec3(1.0, 0.9, 0.75) * mie * rim;
-  gl_FragColor = vec4(col, clamp(rim * day, 0.0, 1.0));
+  gl_FragColor = vec4(col * camFade, clamp(rim * day * camFade, 0.0, 1.0));
   #include <logdepthbuf_fragment>
 }`;
 
@@ -585,6 +591,8 @@ function makeAtmosphere(radius, colorHex, power, intensity) {
     uniforms: {
       uColor:     { value: new THREE.Color(colorHex) },
       uSunPos:    { value: new THREE.Vector3() },
+      uCenter:    { value: new THREE.Vector3() },
+      uShellR:    { value: radius },
       uPower:     { value: power },
       uIntensity: { value: intensity }
     },
@@ -1093,53 +1101,13 @@ function _sstep(a, b, x) {
 }
 
 // ---------- GLSL side: identical recipe + biome shading ---------------
-const TERRA_GLSL_VERT = GLSL_NOISE + `
+const TERRA_GLSL_VERT = `
+attribute float aHeight;
 uniform float uTerraR;
 uniform float uTerraAmp;
 varying float vTerraH;
 varying float vTerraSlope;
-varying vec3 vTerraDir;
-float tRidged(vec3 p, int oct){
-  float a = 0.5, f = 1.0, w = 1.0, s = 0.0;
-  for (int i = 0; i < 5; i++) {
-    if (i >= oct) break;
-    float n = 1.0 - abs(snoise(p * f));
-    n *= n; n *= w;
-    s += n * a;
-    w = clamp(n * 2.0, 0.0, 1.0);
-    f *= 2.1; a *= 0.5;
-  }
-  return s;
-}
-float tBillow(vec3 p, int oct){
-  float a = 0.5, f = 1.0, s = 0.0;
-  for (int i = 0; i < 4; i++) {
-    if (i >= oct) break;
-    s += a * (abs(snoise(p * f)) * 2.0 - 1.0);
-    f *= 2.03; a *= 0.5;
-  }
-  return s;
-}
-float terrainH(vec3 p){          // EXACT twin of terraHeight() in JS
-  float cont = fbm(p * 1.7 + vec3(5.2), 6);
-  float land = smoothstep(-0.02, 0.22, cont);
-  float mMask = smoothstep(0.25, 0.65, fbm(p * 2.4 + vec3(11.7), 4));
-  float plains = (tBillow(p * 3.3 + vec3(8.5), 4) * 0.5 + 0.5) * 0.16;
-  float mtn = tRidged(p * 4.3 + vec3(3.1), 5);
-  float hLand = 0.05 + plains + mtn * 0.85 * mMask;
-  float ocean = cont * 0.5 - 0.18;
-  return mix(ocean, hLand, land);
-}
-float terrainHLow(vec3 p){       // cheaper gradient probe for normals
-  float cont = fbm(p * 1.7 + vec3(5.2), 4);
-  float land = smoothstep(-0.02, 0.22, cont);
-  float mMask = smoothstep(0.25, 0.65, fbm(p * 2.4 + vec3(11.7), 3));
-  float plains = (tBillow(p * 3.3 + vec3(8.5), 3) * 0.5 + 0.5) * 0.16;
-  float mtn = tRidged(p * 4.3 + vec3(3.1), 4);
-  float hLand = 0.05 + plains + mtn * 0.85 * mMask;
-  float ocean = cont * 0.5 - 0.18;
-  return mix(ocean, hLand, land);
-}`;
+varying vec3 vTerraDir;`;
 
 const TERRA_GLSL_FRAG = `
 varying float vTerraH;
@@ -1241,6 +1209,30 @@ function buildTerraMesh(cfg) {
   const r = cfg.visRadius;
   const amp = r * TERRA_AMP_F;
   const geo = buildQuadSphere(r, 80);          // 6×80² ≈ 77k tris
+
+  // ---- bake per-vertex heights with the PHYSICS height function ----
+  const posA = geo.attributes.position;
+  const nV = posA.count;
+  const heights = new Float32Array(nV);
+  const displaced = new Float32Array(nV * 3);
+  for (let i = 0; i < nV; i++) {
+    const px = posA.array[i*3], py = posA.array[i*3+1], pz = posA.array[i*3+2];
+    const l = Math.hypot(px, py, pz) || 1;
+    const dx = px / l, dy = py / l, dz = pz / l;
+    const h = terraHeight(dx, dy, dz);
+    heights[i] = h;
+    const R2 = r + h * amp;
+    displaced[i*3] = dx * R2; displaced[i*3+1] = dy * R2; displaced[i*3+2] = dz * R2;
+  }
+  geo.setAttribute('aHeight', new THREE.BufferAttribute(heights, 1));
+  // accurate lighting normals: compute them on the DISPLACED surface,
+  // then restore the base-sphere positions (the GPU re-displaces them)
+  const basePos = posA.array.slice();
+  posA.array.set(displaced);
+  geo.computeVertexNormals();
+  posA.array.set(basePos);
+  posA.needsUpdate = true;
+
   const mat = new THREE.MeshStandardMaterial({ roughness: 0.93, metalness: 0.02 });
   mat.onBeforeCompile = (shader) => {
     shader.uniforms.uTerraR = { value: r };
@@ -1251,24 +1243,13 @@ function buildTerraMesh(cfg) {
 `#include <beginnormal_vertex>
 {
   vec3 dirN = normalize(position);
-  float e = 0.0035;
-  vec3 tA = normalize(abs(dirN.y) < 0.99 ? cross(dirN, vec3(0.0, 1.0, 0.0)) : vec3(1.0, 0.0, 0.0));
-  vec3 tB = normalize(cross(dirN, tA));
-  float h0 = terrainH(dirN);
-  float hA = terrainHLow(normalize(dirN + tA * e));
-  float hB = terrainHLow(normalize(dirN + tB * e));
-  vec3 p0 = dirN * (uTerraR + h0 * uTerraAmp);
-  vec3 pA = normalize(dirN + tA * e) * (uTerraR + hA * uTerraAmp);
-  vec3 pB = normalize(dirN + tB * e) * (uTerraR + hB * uTerraAmp);
-  objectNormal = normalize(cross(pA - p0, pB - p0));
-  if (dot(objectNormal, dirN) < 0.0) objectNormal = -objectNormal;
-  vTerraH = h0;
+  vTerraH = aHeight;
   vTerraDir = dirN;
-  vTerraSlope = clamp(1.0 - dot(objectNormal, dirN), 0.0, 1.0);
+  vTerraSlope = clamp(1.0 - dot(normalize(objectNormal), dirN), 0.0, 1.0);
 }`)
       .replace('#include <begin_vertex>',
 `#include <begin_vertex>
-transformed = normalize(position) * (uTerraR + vTerraH * uTerraAmp);`);
+transformed = normalize(position) * (uTerraR + aHeight * uTerraAmp);`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', '#include <common>\n' + TERRA_GLSL_FRAG)
       .replace('#include <color_fragment>', '#include <color_fragment>\n' + TERRA_BIOME);
@@ -2182,51 +2163,45 @@ function physicsStep(dt) {
     ship.fuel = Math.max(0, ship.fuel - 0.6 * dt);
     ship.throttle = Math.max(ship.throttle, 0.4);
   }
-  // ---- LINEAR DAMPING + FLIGHT ASSIST while idle -------------------
-  // RULE (the "invisible shield" fix): near a planet, NOTHING may brake
-  // the ship's inward motion except real physics (drag) and the ground
-  // itself. Auto-friction is therefore ANISOTROPIC — full strength on
-  // tangential + climbing motion (keeps handling crisp), only 15% on
-  // descent, so a coasting approach carries all the way to the surface.
+  // ---- LINEAR DAMPING while idle — GRAVITY ALWAYS PULLS -------------
+  // FINAL "invisible shield" fix. The previous hover-assist parked the
+  // ship in mid-air whenever the keys were released: from the cockpit
+  // that IS a force-field around the planet. It is now removed
+  // entirely. The rules near a body are simply:
+  //   • gravity pulls, every frame, unconditionally;
+  //   • auto-friction is anisotropic — full on tangential/climbing
+  //     motion, 15% on descent — so it can slow but NEVER stop a fall;
+  //   • below 30 u altitude a LANDING FLARE (auto retro-thruster,
+  //     hard-capped at 40 u/s² ≈ one tenth of turbo thrust) trims the
+  //     descent toward a soft 6 u/s touchdown. Bounded force = it can
+  //     cushion, it cannot wall: any deliberate thrust overpowers it
+  //     and any fast dive simply lands hard, as Newton demands.
   else if (!thrusting && mode.damp > 0) {
     const kFull = 1 - Math.exp(-mode.damp * dt);
     const hasFrame = !!(gb && !observing &&
       ship.pos.distanceTo(gb.position) < gb.visRadius * 60);
+    if (hasFrame) _radV.copy(ship.pos).sub(gb.position).normalize();
     if (relSpeed > 0.01) {
       if (hasFrame) {
-        _radV.copy(ship.pos).sub(gb.position).normalize();
-        const vr = _relV.dot(_radV);
-        _tanV.copy(_relV).addScaledVector(_radV, -vr);   // tangential part
+        const vrd = _relV.dot(_radV);
+        _tanV.copy(_relV).addScaledVector(_radV, -vrd);  // tangential part
         ship.vel.addScaledVector(_tanV, -kFull);
-        const kRad = vr < 0 ? 1 - Math.exp(-mode.damp * 0.15 * dt) : kFull;
-        ship.vel.addScaledVector(_radV, -vr * kRad);
+        const kRad = vrd < 0 ? 1 - Math.exp(-mode.damp * 0.15 * dt) : kFull;
+        ship.vel.addScaledVector(_radV, -vrd * kRad);
       } else {
         ship.vel.addScaledVector(_relV, -kFull);
       }
     }
-    // current radial descent rate (after damping)
-    let vr = 0;
-    if (hasFrame) {
-      vr = _tmpV2.copy(ship.vel).sub(_refVel).dot(_radV);
-    }
-    // flight assist (hover): cancels gravity ONLY while near-stationary
-    // or in a slow controlled descent — a committed dive (vr < −12) is
-    // left entirely to gravity, exactly as Newton intended.
-    const assist = THREE.MathUtils.clamp(1 - relSpeed / 30, 0, 1);
-    if (assist > 0 && (!hasFrame || vr > -12)) {
-      ship.vel.addScaledVector(_gAcc, -assist * dt);
-    }
-    // glide servo: DOWNWARD-ONLY. It eases an idle ship into a soft
-    // 6 u/s touchdown but is mathematically incapable of pushing the
-    // ship away from the planet (correction clamped ≤ 0).
+    // landing flare (bounded auto-retro), only below 30 u altitude
     if (hasFrame && gb.type !== 'star') {
       const dg = ship.pos.distanceTo(gb.position);
       const reachG = gb.maxTerrain !== undefined ? gb.maxTerrain : gb.visRadius * 0.12;
-      if (dg < gb.visRadius + reachG + 48) {
+      if (dg < gb.visRadius + reachG + 32) {
         const alt = dg - gb.surfaceRadius(ship.pos);
-        if (alt < 45) {
-          const c = Math.min(0, -6 - vr);      // never positive = never up
-          ship.vel.addScaledVector(_radV, c * Math.min(1, 4 * dt));
+        if (alt < 30) {
+          const vr = _tmpV2.copy(ship.vel).sub(_refVel).dot(_radV);
+          const a = THREE.MathUtils.clamp((-6 - vr) * 4, -40, 40);
+          ship.vel.addScaledVector(_radV, a * dt);
         }
       }
     }
@@ -2328,7 +2303,10 @@ function updateBodies(dt) {
       b.gasMat.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
     }
     if (b.type === 'star') b.mesh.material.uniforms.uTime.value = perfTime;
-    if (b._atmoMat) b._atmoMat.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
+    if (b._atmoMat) {
+      b._atmoMat.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
+      b._atmoMat.uniforms.uCenter.value.copy(b.position);
+    }
   }
   if (systems[0] && systems[0].belt)
     systems[0].belt.rotation.y += 0.002 * dt * Math.min(warp, 50);
@@ -2393,9 +2371,14 @@ function updateHUD() {
   const nb = nearestBody();
   if (nb) {
     ui.nearName.textContent = nb.name;
-    const d = nb.position.distanceTo(ship.pos);
-    ui.nearDist.textContent = fmtDist(d);
-    ui.alt.textContent = fmtDist(Math.max(0, d - nb.visRadius));
+    ui.nearDist.textContent = fmtDist(nb.position.distanceTo(ship.pos));
+  }
+  // ALT = height above the gravitationally dominant body (the one that
+  // pulls you and that you would land on) — not a passing moon
+  const gbh = gravBody();
+  if (gbh) {
+    const dh = gbh.position.distanceTo(ship.pos);
+    ui.alt.textContent = fmtDist(Math.max(0, dh - gbh.visRadius));
   }
   for (const id in flagTimers) {
     flagTimers[id] -= 0.05;
