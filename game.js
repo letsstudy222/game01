@@ -1,23 +1,23 @@
 /* =====================================================================
-   HELIOS — Procedural 3D Universe Simulator
+   HELIOS — Procedural 3D Universe Simulator  (v2)
    Pure client-side: HTML5 + Vanilla JS + Three.js r128 (CDN).
-   No backend, no bundler. Deploy the folder as-is to GitHub Pages.
    ---------------------------------------------------------------------
-   Systems:
-     1. Kepler orbital mechanics (solved per-frame via Newton iteration)
-     2. Procedural planets — 3D simplex-noise terrain, crater fields,
-        GLSL gas-giant band shaders, Rayleigh/Mie-style atmosphere glow
-     3. Newtonian ship physics — inertia, n-body gravity, slingshots,
-        atmospheric drag + re-entry burn
-     4. Survival HUD — fuel / hull / shields / planetary scanner
+   v2 changes:
+     • Ship physics: linear damping (auto-decelerate), 3 speed modes
+       (NORMAL / TURBO=Shift / WARP DRIVE=F or J with FOV stretch)
+     • True logarithmic scaling for radii AND orbital distances
+     • THREE.Clock + delta-time Euler integration (FPS-independent)
+     • Realistic per-planet surfaces: cratered gray Mercury, cloud-
+       shrouded volcanic Venus, specular-ocean Earth with drifting
+       clouds, CO₂-capped Mars, counter-flowing Jupiter bands + Great
+       Red Spot, straw Saturn + bright rings, smooth cyan Uranus,
+       deep-blue Neptune with white streaks + Great Dark Spot
    ===================================================================== */
 'use strict';
 
 /* =====================================================================
-   0. UTILITIES
+   0. UTILITIES — seeded RNG + simplex noise (JS & GLSL)
    ===================================================================== */
-
-// Deterministic seeded RNG (mulberry32) — powers all procedural content.
 function mulberry32(seed) {
   let a = seed >>> 0;
   return function () {
@@ -28,9 +28,6 @@ function mulberry32(seed) {
   };
 }
 
-// ------------------------- 3D Simplex noise (JS) --------------------
-// Compact implementation (Stefan Gustavson's algorithm) used for CPU
-// terrain displacement. No texture files needed anywhere in the game.
 const SimplexNoise = (function () {
   const F3 = 1 / 3, G3 = 1 / 6;
   const grad3 = [
@@ -69,9 +66,9 @@ const SimplexNoise = (function () {
       else if (x0 < z0)  { i1=0;j1=1;k1=0; i2=0;j2=1;k2=1; }
       else               { i1=0;j1=1;k1=0; i2=1;j2=1;k2=0; }
     }
-    const x1 = x0 - i1 + G3,     y1 = y0 - j1 + G3,     z1 = z0 - k1 + G3;
-    const x2 = x0 - i2 + 2*G3,   y2 = y0 - j2 + 2*G3,   z2 = z0 - k2 + 2*G3;
-    const x3 = x0 - 1 + 3*G3,    y3 = y0 - 1 + 3*G3,    z3 = z0 - 1 + 3*G3;
+    const x1 = x0 - i1 + G3,   y1 = y0 - j1 + G3,   z1 = z0 - k1 + G3;
+    const x2 = x0 - i2 + 2*G3, y2 = y0 - j2 + 2*G3, z2 = z0 - k2 + 2*G3;
+    const x3 = x0 - 1 + 3*G3,  y3 = y0 - 1 + 3*G3,  z3 = z0 - 1 + 3*G3;
     const ii = i & 255, jj = j & 255, kk = k & 255;
     let t0 = 0.6 - x0*x0 - y0*y0 - z0*z0;
     if (t0 < 0) n0 = 0; else {
@@ -97,12 +94,11 @@ const SimplexNoise = (function () {
       t3 *= t3;
       n3 = t3 * t3 * (grad3[gi3][0]*x3 + grad3[gi3][1]*y3 + grad3[gi3][2]*z3);
     }
-    return 32 * (n0 + n1 + n2 + n3); // roughly in [-1, 1]
+    return 32 * (n0 + n1 + n2 + n3);
   };
   return Simplex;
 })();
 
-// Fractal Brownian Motion over simplex — the terrain workhorse.
 function fbm(simplex, x, y, z, octaves, lacunarity, gain) {
   let amp = 0.5, freq = 1, sum = 0;
   for (let o = 0; o < octaves; o++) {
@@ -113,8 +109,6 @@ function fbm(simplex, x, y, z, octaves, lacunarity, gain) {
   return sum;
 }
 
-// ------------------------- GLSL noise chunk --------------------------
-// Ashima/Ian McEwan simplex noise, shared by every procedural shader.
 const GLSL_NOISE = `
 vec3 mod289(vec3 x){return x - floor(x * (1.0/289.0)) * 289.0;}
 vec4 mod289(vec4 x){return x - floor(x * (1.0/289.0)) * 289.0;}
@@ -173,18 +167,24 @@ float fbm(vec3 p, int oct){
 }`;
 
 /* =====================================================================
-   1. GLOBAL CONFIG & SCALING
+   1. LOGARITHMIC SCALING
    ---------------------------------------------------------------------
-   "Smart scaling": distances use 1 AU = 1200 units; body radii are
-   compressed with a square-root law so the Sun does not swallow the
-   inner planets visually. Z-fighting across these huge ranges is
-   eliminated with the renderer's logarithmic depth buffer.
+   Real 1:1 space is 99.9999% emptiness. We compress it with log maps:
+     radius   : R = (ln(km) − 5)^2.2 × 1.5        (log-power: keeps the
+                Sun ≫ Jupiter ≫ Earth ≫ Moon contrast that pure ln loses)
+     distance : D = (ln(km) − offset) × K          (planets vs moons use
+                different offsets/K, both pure Math.log as requested)
+   The ship is ~2 units long, so Earth (R≈28) towers over it and
+   Jupiter (R≈82) fills the sky on approach. The renderer's logarithmic
+   depth buffer removes Z-fighting across the whole range.
    ===================================================================== */
-const AU = 1200;                                   // world units per AU
-const radiusScale = km => Math.pow(km, 0.5) * 0.28; // sqrt compression
-const YEAR_SECONDS = 300;                          // 1 Earth year at warp ×1
+function logRadius(km)      { return Math.pow(Math.log(km) - 5, 2.2) * 1.5; }
+function logOrbitPlanet(km) { return (Math.log(km) - 16.8) * 2600; }  // heliocentric
+function logOrbitMoon(km)   { return (Math.log(km) - 11.7) * 140;  }  // planetocentric
+const KM_PER_AU = 1.496e8;
+const YEAR_SECONDS = 300;            // 1 Earth year at time-warp ×1
 const WARP_STEPS = [1, 10, 50, 200, 1000];
-const G_GAME = 1.25;                               // gravity tuning factor
+const G_GAME = 1.25;
 
 const canvas = document.getElementById('space');
 const renderer = new THREE.WebGLRenderer({
@@ -195,8 +195,10 @@ renderer.setSize(window.innerWidth, window.innerHeight);
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(
-  62, window.innerWidth / window.innerHeight, 0.1, 5e6);
+  62, window.innerWidth / window.innerHeight, 0.05, 5e6);
 scene.add(new THREE.AmbientLight(0x223344, 0.35));
+
+const clock = new THREE.Clock();   // FPS-independent delta time
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -205,7 +207,7 @@ window.addEventListener('resize', () => {
 });
 
 /* =====================================================================
-   2. STARFIELD (background — 9000 points, milky-way band bias)
+   2. STARFIELD + glow texture helper
    ===================================================================== */
 function buildStarfield() {
   const rand = mulberry32(777);
@@ -215,18 +217,15 @@ function buildStarfield() {
   const bandNormal = new THREE.Vector3(0.35, 1, 0.2).normalize();
   const v = new THREE.Vector3();
   for (let i = 0; i < N; i++) {
-    // uniform direction
     const u = rand() * 2 - 1, th = rand() * Math.PI * 2;
     const s = Math.sqrt(1 - u * u);
     v.set(s * Math.cos(th), u, s * Math.sin(th));
-    // 45% of stars pulled toward a galactic band
     if (rand() < 0.45) {
       const d = v.dot(bandNormal);
       v.addScaledVector(bandNormal, -d * 0.85).normalize();
     }
     const R = 2.2e6;
     pos[i*3] = v.x * R; pos[i*3+1] = v.y * R; pos[i*3+2] = v.z * R;
-    // star colour temperature
     const t = rand();
     let r, g, b;
     if (t < 0.6)      { r = 1;   g = 1;    b = 1;   }
@@ -250,7 +249,6 @@ function buildStarfield() {
 }
 const starfield = buildStarfield();
 
-// Canvas-generated radial glow texture (reused for sun corona & engine)
 function makeGlowTexture(inner, outer) {
   const c = document.createElement('canvas');
   c.width = c.height = 128;
@@ -261,17 +259,14 @@ function makeGlowTexture(inner, outer) {
   g.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, 128, 128);
-  const tex = new THREE.CanvasTexture(c);
-  return tex;
+  return new THREE.CanvasTexture(c);
 }
 
 /* =====================================================================
-   3. SHADERS — atmosphere (Rayleigh/Mie style), gas giants, sun, rings
+   3. SHADERS — atmosphere, clouds, gas giants v2, sun, rings
+   (all include Three.js log-depth chunks so custom materials share the
+    same logarithmic depth buffer as built-in materials)
    ===================================================================== */
-
-// --- Atmosphere glow: back-side shell. Fresnel rim modulated by the
-// sun direction (Rayleigh day-side scattering) plus a Mie forward-
-// scattering lobe that brightens the limb facing the sun.
 const ATMO_VERT = `
 #include <common>
 #include <logdepthbuf_pars_vertex>
@@ -287,7 +282,7 @@ void main(){
 const ATMO_FRAG = `
 #include <common>
 #include <logdepthbuf_pars_fragment>
-uniform vec3 uColor;      // Rayleigh tint (blue for Earth, gold for Venus…)
+uniform vec3 uColor;
 uniform vec3 uSunPos;
 uniform float uPower;
 uniform float uIntensity;
@@ -296,11 +291,8 @@ varying vec3 vWorldPos;
 void main(){
   vec3 viewDir = normalize(cameraPosition - vWorldPos);
   vec3 sunDir  = normalize(uSunPos - vWorldPos);
-  // rim term (shell rendered BackSide, so invert normal)
   float rim = pow(clamp(dot(viewDir, vNormal) + 1.05, 0.0, 1.05), uPower);
-  // day-side illumination (Rayleigh-ish)
   float day = clamp(dot(-vNormal, sunDir) * 0.6 + 0.5, 0.05, 1.0);
-  // Mie forward scattering: bright halo when looking toward the sun
   float mie = pow(max(dot(-viewDir, sunDir), 0.0), 24.0) * 0.9;
   vec3 col = uColor * rim * day * uIntensity + vec3(1.0, 0.9, 0.75) * mie * rim;
   gl_FragColor = vec4(col, clamp(rim * day, 0.0, 1.0));
@@ -318,15 +310,75 @@ function makeAtmosphere(radius, colorHex, power, intensity) {
       uPower:     { value: power },
       uIntensity: { value: intensity }
     },
-    side: THREE.BackSide,
-    transparent: true,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false
+    side: THREE.BackSide, transparent: true,
+    blending: THREE.AdditiveBlending, depthWrite: false
   });
   return new THREE.Mesh(geo, mat);
 }
 
-// --- Gas giant surface: animated banded fbm, optional storm vortex
+// --- Cloud layer: animated fbm coverage. Venus uses near-opaque cream
+//     (surface completely shrouded); Earth uses drifting white patches.
+const CLOUD_VERT = `
+#include <common>
+#include <logdepthbuf_pars_vertex>
+varying vec3 vPos;
+varying vec3 vNormalW;
+varying vec3 vWorldPos;
+void main(){
+  vPos = position;
+  vNormalW = normalize(mat3(modelMatrix) * normal);
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vWorldPos = wp.xyz;
+  gl_Position = projectionMatrix * viewMatrix * wp;
+  #include <logdepthbuf_vertex>
+}`;
+const CLOUD_FRAG = `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+` + GLSL_NOISE + `
+uniform vec3 uColA;      // lit cloud colour
+uniform vec3 uColB;      // shadowed cloud colour
+uniform vec3 uSunPos;
+uniform float uTime;
+uniform float uCover;    // 0..1  coverage threshold (1 = fully shrouded)
+uniform float uScale;
+uniform float uSpeed;
+varying vec3 vPos;
+varying vec3 vNormalW;
+varying vec3 vWorldPos;
+void main(){
+  vec3 p = normalize(vPos);
+  float n = fbm(p * uScale + vec3(uTime * uSpeed, 0.0, uTime * uSpeed * 0.6), 5);
+  float n2 = fbm(p * uScale * 3.1 + vec3(0.0, uTime * uSpeed * 1.7, 0.0), 4);
+  float cover = smoothstep(0.55 - uCover, 0.75 - uCover * 0.5, n * 0.7 + n2 * 0.3 + 0.5);
+  vec3 sunDir = normalize(uSunPos - vWorldPos);
+  float light = clamp(dot(vNormalW, sunDir), 0.0, 1.0);
+  vec3 col = mix(uColB, uColA, pow(light, 0.7) * (0.6 + 0.4 * n2));
+  gl_FragColor = vec4(col * (0.15 + light), cover);
+  #include <logdepthbuf_fragment>
+}`;
+
+function makeClouds(radius, opts) {
+  const geo = new THREE.SphereGeometry(radius, 56, 40);
+  const mat = new THREE.ShaderMaterial({
+    vertexShader: CLOUD_VERT, fragmentShader: CLOUD_FRAG,
+    uniforms: {
+      uColA:  { value: new THREE.Color(opts.colA) },
+      uColB:  { value: new THREE.Color(opts.colB) },
+      uSunPos:{ value: new THREE.Vector3() },
+      uTime:  { value: 0 },
+      uCover: { value: opts.cover },
+      uScale: { value: opts.scale },
+      uSpeed: { value: opts.speed }
+    },
+    transparent: true, depthWrite: false
+  });
+  return new THREE.Mesh(geo, mat);
+}
+
+// --- Gas giant v2: counter-flowing latitudinal bands (adjacent bands
+//     drift in opposite directions like real zonal jets), tunable
+//     smoothness (Uranus), storm colour (Great Red / Great Dark Spot).
 const GAS_VERT = `
 #include <common>
 #include <logdepthbuf_pars_vertex>
@@ -345,40 +397,45 @@ const GAS_FRAG = `
 #include <common>
 #include <logdepthbuf_pars_fragment>
 ` + GLSL_NOISE + `
-uniform vec3 uColA;   // light band
-uniform vec3 uColB;   // dark band
-uniform vec3 uColC;   // accent
+uniform vec3 uColA;        // light band
+uniform vec3 uColB;        // dark band
+uniform vec3 uColC;        // streak accent (white wisps)
+uniform vec3 uStormColor;
 uniform vec3 uSunPos;
 uniform float uTime;
 uniform float uSeed;
 uniform float uBands;
-uniform float uStorm;   // 1.0 => Great-Red-Spot style vortex
+uniform float uTurb;       // band-edge turbulence (small => smooth Uranus)
+uniform float uFlow;       // zonal jet speed
+uniform float uStorm;      // 0 = none
+uniform float uStormLat;
 varying vec3 vPos;
 varying vec3 vNormalW;
 varying vec3 vWorldPos;
 void main(){
   vec3 p = normalize(vPos);
   float lat = p.y;
-  // turbulent distortion of the band latitude (fluid-like motion)
-  float turb = fbm(p * 3.0 + vec3(uSeed, uTime * 0.02, 0.0), 5) * 0.35
-             + fbm(p * 9.0 + vec3(0.0, uSeed, uTime * 0.05), 4) * 0.12;
+  float lon = atan(p.z, p.x);
+  // adjacent latitude bands flow in OPPOSITE directions
+  float bandIdx = floor((lat * 0.5 + 0.5) * uBands);
+  float dir = mod(bandIdx, 2.0) * 2.0 - 1.0;
+  float lonF = lon + dir * uTime * uFlow;
+  float cl = sqrt(max(0.0, 1.0 - lat * lat));
+  vec3 q = vec3(cos(lonF) * cl, lat, sin(lonF) * cl);
+  float turb = fbm(q * 3.0 + vec3(uSeed), 5) * uTurb
+             + fbm(q * 9.0 + vec3(0.0, uSeed, uSeed), 4) * uTurb * 0.35;
   float bands = sin((lat + turb) * uBands * 3.14159);
   float m = smoothstep(-0.85, 0.85, bands);
   vec3 col = mix(uColB, uColA, m);
-  // fine streaks along flow
-  float streak = fbm(vec3(p.x * 2.0, (lat + turb) * 20.0, p.z * 2.0 + uSeed), 4);
-  col = mix(col, uColC, smoothstep(0.35, 0.8, streak) * 0.35);
-  // storm vortex (anticyclone)
+  float streak = fbm(vec3(q.x * 2.0, (lat + turb) * 22.0, q.z * 2.0 + uSeed), 4);
+  col = mix(col, uColC, smoothstep(0.35, 0.85, streak) * 0.4);
   if (uStorm > 0.5) {
-    float lon = atan(p.z, p.x) + uTime * 0.004;
-    vec2 sp = vec2(mod(lon + 3.14159, 6.28318) - 3.14159, lat + 0.32);
-    sp.x *= 0.55;
+    vec2 sp = vec2(mod(lonF * 0.55 + 3.14159, 6.28318) - 3.14159, lat - uStormLat);
     float d = length(sp * vec2(3.2, 9.0));
     float spot = smoothstep(1.0, 0.25, d);
-    float swirl = fbm(vec3(sp * 12.0, uTime * 0.1 + uSeed), 4) * 0.25;
-    col = mix(col, vec3(0.78, 0.28, 0.16) + swirl, spot * 0.9);
+    float swirl = fbm(vec3(sp * 12.0, uTime * 0.1 + uSeed), 4) * 0.2;
+    col = mix(col, uStormColor + swirl, spot * 0.92);
   }
-  // Lambert lighting from sun
   vec3 sunDir = normalize(uSunPos - vWorldPos);
   float light = clamp(dot(vNormalW, sunDir), 0.0, 1.0);
   light = pow(light, 0.8) * 1.15 + 0.03;
@@ -386,24 +443,35 @@ void main(){
   #include <logdepthbuf_fragment>
 }`;
 
-function makeGasMaterial(opts) {
+function makeGasMaterial(o) {
   return new THREE.ShaderMaterial({
-    vertexShader: GAS_VERT,
-    fragmentShader: GAS_FRAG,
+    vertexShader: GAS_VERT, fragmentShader: GAS_FRAG,
     uniforms: {
-      uColA:  { value: new THREE.Color(opts.colA) },
-      uColB:  { value: new THREE.Color(opts.colB) },
-      uColC:  { value: new THREE.Color(opts.colC) },
+      uColA:  { value: new THREE.Color(o.colA) },
+      uColB:  { value: new THREE.Color(o.colB) },
+      uColC:  { value: new THREE.Color(o.colC) },
+      uStormColor: { value: new THREE.Color(o.stormColor || 0xc74a2a) },
       uSunPos:{ value: new THREE.Vector3() },
       uTime:  { value: 0 },
-      uSeed:  { value: opts.seed || 0 },
-      uBands: { value: opts.bands || 9 },
-      uStorm: { value: opts.storm ? 1 : 0 }
+      uSeed:  { value: o.seed || 0 },
+      uBands: { value: o.bands || 9 },
+      uTurb:  { value: o.turb !== undefined ? o.turb : 0.35 },
+      uFlow:  { value: o.flow !== undefined ? o.flow : 0.01 },
+      uStorm: { value: o.storm ? 1 : 0 },
+      uStormLat: { value: o.stormLat !== undefined ? o.stormLat : -0.32 }
     }
   });
 }
 
-// --- Sun surface: boiling emissive fbm
+const SUN_VERT = `
+#include <common>
+#include <logdepthbuf_pars_vertex>
+varying vec3 vPos;
+void main(){
+  vPos = position;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  #include <logdepthbuf_vertex>
+}`;
 const SUN_FRAG = `
 #include <common>
 #include <logdepthbuf_pars_fragment>
@@ -421,17 +489,7 @@ void main(){
   gl_FragColor = vec4(col, 1.0);
   #include <logdepthbuf_fragment>
 }`;
-const SUN_VERT = `
-#include <common>
-#include <logdepthbuf_pars_vertex>
-varying vec3 vPos;
-void main(){
-  vPos = position;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-  #include <logdepthbuf_vertex>
-}`;
 
-// --- Planetary rings: noise-banded translucent disc
 const RING_VERT = `
 #include <common>
 #include <logdepthbuf_pars_vertex>
@@ -450,27 +508,24 @@ uniform float uOuter;
 uniform vec3 uColA;
 uniform vec3 uColB;
 uniform float uSeed;
+uniform float uBright;    // ice-particle sparkle boost (Saturn = high)
 varying vec3 vLocal;
 void main(){
   float r = length(vLocal.xy);
   float t = (r - uInner) / (uOuter - uInner);
   if (t < 0.0 || t > 1.0) discard;
-  // radial band structure — 1-D noise sampled along radius
   float bands = fbm(vec3(t * 26.0, uSeed, 0.0), 4) * 0.5 + 0.5;
   float gaps  = smoothstep(0.28, 0.36, fbm(vec3(t * 60.0, uSeed * 2.0, 1.0), 3) * 0.5 + 0.5);
+  float fine  = fbm(vec3(t * 240.0, uSeed * 3.0, 2.0), 3) * 0.5 + 0.5; // billions of grains
   float edge  = smoothstep(0.0, 0.06, t) * smoothstep(1.0, 0.92, t);
-  float alpha = bands * gaps * edge * 0.85;
-  vec3 col = mix(uColB, uColA, bands);
+  float alpha = bands * gaps * edge * (0.7 + 0.3 * fine);
+  vec3 col = mix(uColB, uColA, bands) * (0.8 + fine * uBright);
   gl_FragColor = vec4(col, alpha);
   #include <logdepthbuf_fragment>
 }`;
 
 /* =====================================================================
-   4. KEPLER ORBITAL MECHANICS
-   ---------------------------------------------------------------------
-   Position from classical elements (a, e, i, Ω, ω, M0).
-   Kepler's equation M = E − e·sin(E) is solved every frame with
-   Newton–Raphson iteration; period follows Kepler's third law T ∝ a^1.5.
+   4. KEPLER ORBITAL MECHANICS  (unchanged math, log-scaled display a)
    ===================================================================== */
 function solveKepler(M, e) {
   let E = e < 0.8 ? M : Math.PI;
@@ -482,16 +537,17 @@ function solveKepler(M, e) {
   return E;
 }
 
-// Fills `out` with position relative to the parent body.
+// el.a       — DISPLAY semi-major axis (log-scaled world units)
+// el.aRealAU — REAL semi-major axis, drives the period (Kepler III)
 function keplerPosition(el, simTime, out) {
-  const period = YEAR_SECONDS * Math.pow(el.a / AU, 1.5) * (el.periodScale || 1);
+  const period = YEAR_SECONDS * Math.pow(el.aRealAU, 1.5) * (el.periodScale || 1);
   const M = el.M0 + (2 * Math.PI * simTime) / period;
   const E = solveKepler(M % (2 * Math.PI), el.e);
-  const xo = el.a * (Math.cos(E) - el.e);                       // orbital plane
+  const xo = el.a * (Math.cos(E) - el.e);
   const yo = el.a * Math.sqrt(1 - el.e * el.e) * Math.sin(E);
-  const cw = Math.cos(el.w),  sw = Math.sin(el.w);              // arg. periapsis
-  const cO = Math.cos(el.O),  sO = Math.sin(el.O);              // asc. node
-  const ci = Math.cos(el.i),  si = Math.sin(el.i);              // inclination
+  const cw = Math.cos(el.w),  sw = Math.sin(el.w);
+  const cO = Math.cos(el.O),  sO = Math.sin(el.O);
+  const ci = Math.cos(el.i),  si = Math.sin(el.i);
   const x1 = cw * xo - sw * yo;
   const y1 = sw * xo + cw * yo;
   out.set(
@@ -503,46 +559,43 @@ function keplerPosition(el, simTime, out) {
 }
 
 /* =====================================================================
-   5. CELESTIAL BODY FACTORY
+   5. CELESTIAL BODY FACTORY v2
    ===================================================================== */
-const bodies = [];   // every star/planet/moon in every system
-const systems = [];  // star systems for the N-key jump
+const bodies = [];
+const systems = [];
 
-// ---- Rocky planet: CPU noise-displaced sphere with crater fields ----
+// ---- Rocky planet: noise terrain + craters + optional specular ocean
+//      sphere (Phong sun-glint) + optional lava glow at low elevations
 function buildRockyMesh(cfg) {
   const r = cfg.visRadius;
-  const detail = cfg.detail || (r > 15 ? 96 : 48);
+  const detail = cfg.detail || (r > 20 ? 112 : 64);
   const geo = new THREE.SphereGeometry(r, detail, Math.round(detail * 0.66));
   const pos = geo.attributes.position;
   const simplex = new SimplexNoise(cfg.seed);
   const rand = mulberry32(cfg.seed ^ 0x9e3779b9);
 
-  // crater field
   const craters = [];
-  const nCr = cfg.craters || 0;
-  for (let c = 0; c < nCr; c++) {
+  for (let c = 0; c < (cfg.craters || 0); c++) {
     const u = rand() * 2 - 1, th = rand() * Math.PI * 2;
     const s = Math.sqrt(1 - u * u);
     craters.push({
       dir: new THREE.Vector3(s * Math.cos(th), u, s * Math.sin(th)),
-      size: 0.04 + rand() * 0.16,          // angular radius (rad)
-      depth: (0.004 + rand() * 0.012) * r  // world units
+      size: 0.03 + rand() * 0.14,
+      depth: (0.004 + rand() * 0.012) * r
     });
   }
 
   const colors = new Float32Array(pos.count * 3);
   const v = new THREE.Vector3();
   const cTmp = new THREE.Color();
-  const amp = cfg.amp * r;                 // mountain amplitude
-  const seaLevel = cfg.seaLevel;           // null = no ocean
+  const amp = cfg.amp * r;
+  const seaLevel = cfg.ocean ? cfg.ocean.level : null;
 
   for (let idx = 0; idx < pos.count; idx++) {
     v.fromBufferAttribute(pos, idx).normalize();
-    // base fbm terrain + ridged component for mountain chains/canyons
     let h = fbm(simplex, v.x * cfg.freq, v.y * cfg.freq, v.z * cfg.freq, 6, 2.1, 0.5);
     const ridge = 1 - Math.abs(fbm(simplex, v.x*cfg.freq*2.3+9, v.y*cfg.freq*2.3, v.z*cfg.freq*2.3, 4, 2.2, 0.5));
     h = h * 0.75 + (ridge * ridge - 0.55) * 0.5 * cfg.ridged;
-    // craters (bowl + raised rim)
     for (let c = 0; c < craters.length; c++) {
       const cr = craters[c];
       const ang = Math.acos(THREE.MathUtils.clamp(v.dot(cr.dir), -1, 1));
@@ -553,15 +606,13 @@ function buildRockyMesh(cfg) {
         h += (bowl * 0.8 + rim) * (cr.depth / amp);
       }
     }
-    let hw = h * amp;                       // world-space height
-    let hNorm = h;                          // for colouring
-    if (seaLevel !== null && hw < seaLevel * amp) {
-      hw = seaLevel * amp;                  // flatten oceans
-    }
+    let hw = h * amp;
+    const hNorm = h;
+    // land below sea level is tucked just under the ocean sphere
+    if (seaLevel !== null && hw < seaLevel * amp) hw = seaLevel * amp - 0.05;
     v.multiplyScalar(r + hw);
     pos.setXYZ(idx, v.x, v.y, v.z);
 
-    // ---- colouring by height + latitude ----
     const lat = Math.abs(v.y / v.length());
     const pal = cfg.palette;
     let stop = 0;
@@ -570,23 +621,37 @@ function buildRockyMesh(cfg) {
     const p0 = pal[Math.max(0, stop)], p1 = pal[Math.min(pal.length - 1, stop + 1)];
     const f = p1.h === p0.h ? 0 : THREE.MathUtils.clamp((hn - p0.h) / (p1.h - p0.h), 0, 1);
     cTmp.setHex(p0.c).lerp(new THREE.Color(p1.c), f);
-    if (seaLevel !== null && hNorm < seaLevel) cTmp.setHex(cfg.oceanColor);
-    if (cfg.iceCaps && lat > cfg.iceCaps) cTmp.lerp(new THREE.Color(0xf4f6f8), THREE.MathUtils.clamp((lat - cfg.iceCaps) * 8, 0, 1));
+    // volcanic lava glow in the lowest basins (Venus surface)
+    if (cfg.lava && hNorm < -0.22) {
+      const glow = THREE.MathUtils.clamp((-0.22 - hNorm) * 4, 0, 1);
+      cTmp.lerp(new THREE.Color(0xff5a1a), glow);
+    }
+    if (cfg.iceCaps && lat > cfg.iceCaps)
+      cTmp.lerp(new THREE.Color(0xf4f6f8), THREE.MathUtils.clamp((lat - cfg.iceCaps) * 8, 0, 1));
     colors[idx*3] = cTmp.r; colors[idx*3+1] = cTmp.g; colors[idx*3+2] = cTmp.b;
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
   geo.computeVertexNormals();
-  const mat = new THREE.MeshStandardMaterial({
-    vertexColors: true, roughness: 0.95, metalness: 0.02,
-    flatShading: false
-  });
-  return new THREE.Mesh(geo, mat);
+  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+    vertexColors: true, roughness: 0.95, metalness: 0.02
+  }));
+  // Specular ocean: smooth Phong sphere at sea level — the sun glints
+  // off it (Earth's "specular map" effect) while land stays matte.
+  if (cfg.ocean) {
+    const oc = new THREE.Mesh(
+      new THREE.SphereGeometry(r + (cfg.ocean.level * amp), 64, 44),
+      new THREE.MeshPhongMaterial({
+        color: cfg.ocean.color, specular: 0xaaccee,
+        shininess: cfg.ocean.shininess || 90
+      }));
+    mesh.add(oc);
+  }
+  return mesh;
 }
 
-// ---- Generic body registration ----
 function addBody(cfg) {
   const group = new THREE.Group();
-  let mesh, gasMat = null;
+  let mesh, gasMat = null, cloudMesh = null;
 
   if (cfg.type === 'star') {
     const mat = new THREE.ShaderMaterial({
@@ -599,7 +664,6 @@ function addBody(cfg) {
     });
     mesh = new THREE.Mesh(new THREE.SphereGeometry(cfg.visRadius, 64, 48), mat);
     group.add(mesh);
-    // corona sprite
     const corona = new THREE.Sprite(new THREE.SpriteMaterial({
       map: makeGlowTexture(cfg.glowInner || 'rgba(255,240,190,0.9)',
                            cfg.glowOuter || 'rgba(255,120,30,0.35)'),
@@ -607,35 +671,38 @@ function addBody(cfg) {
     }));
     corona.scale.setScalar(cfg.visRadius * 4.5);
     group.add(corona);
-    const light = new THREE.PointLight(cfg.lightColor || 0xfff4e0, 1.6, 0, 0);
-    group.add(light);
+    group.add(new THREE.PointLight(cfg.lightColor || 0xfff4e0, 1.6, 0, 0));
   } else if (cfg.type === 'gas') {
     gasMat = makeGasMaterial(cfg.gas);
-    mesh = new THREE.Mesh(new THREE.SphereGeometry(cfg.visRadius, 72, 48), gasMat);
+    mesh = new THREE.Mesh(new THREE.SphereGeometry(cfg.visRadius, 80, 56), gasMat);
     group.add(mesh);
     if (cfg.rings) {
       const inner = cfg.visRadius * cfg.rings.inner;
       const outer = cfg.visRadius * cfg.rings.outer;
-      const rg = new THREE.RingGeometry(inner, outer, 160, 1);
       const rm = new THREE.ShaderMaterial({
         vertexShader: RING_VERT, fragmentShader: RING_FRAG,
         uniforms: {
           uInner: { value: inner }, uOuter: { value: outer },
           uColA: { value: new THREE.Color(cfg.rings.colA) },
           uColB: { value: new THREE.Color(cfg.rings.colB) },
-          uSeed: { value: (cfg.seed || 1) % 100 }
+          uSeed: { value: (cfg.seed || 1) % 100 },
+          uBright: { value: cfg.rings.bright !== undefined ? cfg.rings.bright : 0.4 }
         },
         side: THREE.DoubleSide, transparent: true, depthWrite: false
       });
-      const ring = new THREE.Mesh(rg, rm);
+      const ring = new THREE.Mesh(new THREE.RingGeometry(inner, outer, 180, 1), rm);
       ring.rotation.x = Math.PI / 2 + (cfg.rings.tilt || 0);
       group.add(ring);
     }
-  } else { // rocky
+  } else {
     mesh = buildRockyMesh(cfg);
     group.add(mesh);
   }
 
+  if (cfg.clouds) {
+    cloudMesh = makeClouds(cfg.visRadius * cfg.clouds.height, cfg.clouds);
+    group.add(cloudMesh);
+  }
   if (cfg.atmosphere) {
     const at = makeAtmosphere(
       cfg.visRadius * (cfg.atmosphere.scale || 1.16),
@@ -647,20 +714,19 @@ function addBody(cfg) {
 
   scene.add(group);
   const body = {
-    name: cfg.name, type: cfg.type, group, mesh, gasMat,
+    name: cfg.name, type: cfg.type, group, mesh, gasMat, cloudMesh,
     visRadius: cfg.visRadius,
-    orbit: cfg.orbit || null,        // Kepler elements, relative to parent
-    parent: cfg.parent || null,      // another body object
+    orbit: cfg.orbit || null,
+    parent: cfg.parent || null,
     spin: cfg.spin !== undefined ? cfg.spin : 0.02,
     axialTilt: cfg.axialTilt || 0,
-    // gravity: surface acceleration (game units) => mu = g·r²
     mu: (cfg.surfaceG || 0) * cfg.visRadius * cfg.visRadius * G_GAME,
     surfaceG: cfg.surfaceG || 0,
-    atmo: cfg.atmoPhys || null,      // { height, density } for drag
-    scan: cfg.scan || null,          // scanner datasheet
+    atmo: cfg.atmoPhys || null,
+    scan: cfg.scan || null,
     systemIndex: cfg.systemIndex,
     position: new THREE.Vector3(),
-    velocity: new THREE.Vector3(),   // finite-difference, for landing frames
+    velocity: new THREE.Vector3(),
     _prevPos: new THREE.Vector3(),
     _atmoMat: cfg._atmoMat || null
   };
@@ -670,14 +736,16 @@ function addBody(cfg) {
 }
 
 /* =====================================================================
-   6. THE SOLAR SYSTEM — real orbital data (a in AU, e, i in deg)
-   Scanner data uses real physical values.
+   6. THE SOLAR SYSTEM — realistic surfaces, log-scaled geometry
    ===================================================================== */
 const D2R = Math.PI / 180;
-function els(aAU, e, iDeg, M0deg, extra) {
+// distKm: real mean orbital distance (drives log-scaled display radius)
+// aAU:    real semi-major axis in AU (drives the true Kepler period)
+function els(distKm, aAU, e, iDeg, M0deg, extra) {
   return Object.assign({
-    a: aAU * AU, e, i: iDeg * D2R,
-    O: Math.random() * 0, w: (M0deg * 1.7 % 360) * D2R, M0: M0deg * D2R
+    a: extra && extra.moon ? logOrbitMoon(distKm) : logOrbitPlanet(distKm),
+    aRealAU: aAU, e, i: iDeg * D2R,
+    O: 0, w: (M0deg * 1.7 % 360) * D2R, M0: M0deg * D2R
   }, extra || {});
 }
 
@@ -687,7 +755,7 @@ function buildSolarSystem() {
 
   const sun = addBody({
     name: 'Sun', type: 'star', systemIndex: sysIdx,
-    visRadius: radiusScale(696000) * 0.55,   // extra compression for the star
+    visRadius: logRadius(696000),        // ≈ 164 units
     surfaceG: 40, spin: 0.002,
     scan: { cls: 'G2V main-sequence star', mass: '1.989×10³⁰ kg', radius: '696,000 km',
             grav: '274 m/s²', temp: '5,505 °C (photosphere)', press: '—',
@@ -696,31 +764,39 @@ function buildSolarSystem() {
 
   const P = (cfg) => { cfg.parent = sun; cfg.systemIndex = sysIdx; return addBody(cfg); };
 
-  P({ name: 'Mercury', type: 'rocky', visRadius: radiusScale(2440),
-    seed: 11, freq: 3.2, amp: 0.045, ridged: 0.4, craters: 60, seaLevel: null,
-    palette: [{h:0,c:0x4a4440},{h:0.45,c:0x6e6660},{h:0.75,c:0x8d857c},{h:1,c:0xb5aca0}],
-    oceanColor: 0, iceCaps: 0, surfaceG: 3.7, spin: 0.004,
-    orbit: els(0.387, 0.2056, 7.0, 40),
+  // ---- MERCURY: ash-gray, saturated with craters, airless ----
+  P({ name: 'Mercury', type: 'rocky', visRadius: logRadius(2440),
+    seed: 11, freq: 3.4, amp: 0.05, ridged: 0.35, craters: 130,
+    palette: [{h:0,c:0x3f3d3b},{h:0.4,c:0x5c5955},{h:0.7,c:0x7a766f},{h:1,c:0x9d9890}],
+    iceCaps: 0, surfaceG: 3.7, spin: 0.004,
+    orbit: els(5.79e7, 0.387, 0.2056, 7.0, 40),
     scan: { cls: 'Rocky (airless)', mass: '3.30×10²³ kg', radius: '2,440 km',
             grav: '3.70 m/s²', temp: '−173 … +427 °C', press: '≈ 0 (trace exosphere)',
             atmo: [['O₂', 42], ['Na', 29], ['H₂', 22], ['He', 6]] } });
 
-  P({ name: 'Venus', type: 'rocky', visRadius: radiusScale(6052),
-    seed: 22, freq: 2.6, amp: 0.03, ridged: 0.7, craters: 8, seaLevel: null,
-    palette: [{h:0,c:0x8a6b35},{h:0.5,c:0xb98f47},{h:0.8,c:0xd9b164},{h:1,c:0xf0d489}],
-    oceanColor: 0, iceCaps: 0, surfaceG: 8.87, spin: -0.001,
-    orbit: els(0.723, 0.0068, 3.39, 120),
-    atmosphere: { color: 0xe8c56a, scale: 1.22, power: 2.6, intensity: 2.2 },
+  // ---- VENUS: volcanic red surface UNDER a total cream cloud shroud ----
+  P({ name: 'Venus', type: 'rocky', visRadius: logRadius(6052),
+    seed: 22, freq: 2.6, amp: 0.035, ridged: 0.8, craters: 6, lava: true,
+    palette: [{h:0,c:0x5a1e10},{h:0.35,c:0x83402a},{h:0.65,c:0xa25a35},{h:1,c:0xc07a48}],
+    iceCaps: 0, surfaceG: 8.87, spin: -0.001,
+    orbit: els(1.082e8, 0.723, 0.0068, 3.39, 120),
+    clouds: { height: 1.05, colA: 0xf2dc9e, colB: 0xc79a4c,
+              cover: 1.0, scale: 2.2, speed: 0.02 },       // fully shrouded
+    atmosphere: { color: 0xe8c56a, scale: 1.22, power: 2.6, intensity: 2.4 },
     atmoPhys: { height: 1.3, density: 3.0 },
     scan: { cls: 'Rocky (runaway greenhouse)', mass: '4.87×10²⁴ kg', radius: '6,052 km',
             grav: '8.87 m/s²', temp: '462 °C', press: '92 bar',
             atmo: [['CO₂', 96.5], ['N₂', 3.5]] } });
 
-  const earth = P({ name: 'Earth', type: 'rocky', visRadius: radiusScale(6371),
-    seed: 33, freq: 2.2, amp: 0.05, ridged: 0.8, craters: 0, seaLevel: 0.02,
-    palette: [{h:0,c:0x2f6b31},{h:0.55,c:0x5d8a3a},{h:0.72,c:0x8b7355},{h:0.88,c:0x9b9b93},{h:1,c:0xffffff}],
-    oceanColor: 0x1a4f8a, iceCaps: 0.88, surfaceG: 9.81, spin: 0.03, axialTilt: 23.4 * D2R,
-    orbit: els(1.0, 0.0167, 0.0, 200),
+  // ---- EARTH: green/tan continents, specular ocean, drifting clouds ----
+  const earth = P({ name: 'Earth', type: 'rocky', visRadius: logRadius(6371),
+    seed: 33, freq: 2.2, amp: 0.05, ridged: 0.8, craters: 0,
+    ocean: { level: 0.02, color: 0x123f75, shininess: 120 },  // sun-glint sea
+    palette: [{h:0,c:0x2f6b31},{h:0.55,c:0x6f8a3a},{h:0.7,c:0x9c7a4a},{h:0.86,c:0x8f8d85},{h:1,c:0xffffff}],
+    iceCaps: 0.88, surfaceG: 9.81, spin: 0.03, axialTilt: 23.4 * D2R,
+    orbit: els(1.496e8, 1.0, 0.0167, 0.0, 200),
+    clouds: { height: 1.03, colA: 0xffffff, colB: 0x9fb2c8,
+              cover: 0.42, scale: 3.0, speed: 0.012 },       // slow white layer
     atmosphere: { color: 0x4d9eff, scale: 1.18, power: 3.4, intensity: 1.6 },
     atmoPhys: { height: 1.25, density: 1.0 },
     scan: { cls: 'Rocky (habitable)', mass: '5.97×10²⁴ kg', radius: '6,371 km',
@@ -728,105 +804,118 @@ function buildSolarSystem() {
             atmo: [['N₂', 78], ['O₂', 21], ['Ar', 0.9], ['CO₂', 0.04]] } });
 
   addBody({ name: 'Moon', type: 'rocky', parent: earth, systemIndex: sysIdx,
-    visRadius: radiusScale(1737), seed: 44, freq: 3.4, amp: 0.05, ridged: 0.3,
-    craters: 90, seaLevel: null,
+    visRadius: logRadius(1737), seed: 44, freq: 3.4, amp: 0.05, ridged: 0.3,
+    craters: 90,
     palette: [{h:0,c:0x55534f},{h:0.5,c:0x7d7a74},{h:1,c:0xb0aca4}],
-    oceanColor: 0, iceCaps: 0, surfaceG: 1.62, spin: 0.005,
-    orbit: els(0.055, 0.0549, 5.1, 30, { periodScale: 0.25 }),
+    iceCaps: 0, surfaceG: 1.62, spin: 0.005,
+    orbit: els(3.844e5, 0.00257, 0.0549, 5.1, 30, { moon: true, periodScale: 42 }),
     scan: { cls: 'Rocky moon (airless)', mass: '7.35×10²² kg', radius: '1,737 km',
             grav: '1.62 m/s²', temp: '−173 … +127 °C', press: '≈ 0',
             atmo: [['He/Ne/Ar', 100]] } });
 
-  P({ name: 'Mars', type: 'rocky', visRadius: radiusScale(3390),
-    seed: 55, freq: 2.8, amp: 0.075, ridged: 1.0, craters: 45, seaLevel: null,
-    palette: [{h:0,c:0x6e3320},{h:0.45,c:0x9c4a26},{h:0.7,c:0xc06a38},{h:1,c:0xd9915d}],
-    oceanColor: 0, iceCaps: 0.9, surfaceG: 3.71, spin: 0.028, axialTilt: 25 * D2R,
-    orbit: els(1.524, 0.0934, 1.85, 300),
-    atmosphere: { color: 0xd88a58, scale: 1.1, power: 3.8, intensity: 0.7 },
+  // ---- MARS: iron-oxide red, deep canyons, white CO₂ polar caps ----
+  P({ name: 'Mars', type: 'rocky', visRadius: logRadius(3390),
+    seed: 55, freq: 2.8, amp: 0.08, ridged: 1.1, craters: 45,
+    palette: [{h:0,c:0x6e2b18},{h:0.45,c:0xa24522},{h:0.7,c:0xc46a35},{h:1,c:0xdb9258}],
+    iceCaps: 0.88, surfaceG: 3.71, spin: 0.028, axialTilt: 25 * D2R,
+    orbit: els(2.279e8, 1.524, 0.0934, 1.85, 300),
+    atmosphere: { color: 0xe8a07a, scale: 1.1, power: 3.8, intensity: 0.65 }, // thin pink-orange
     atmoPhys: { height: 1.12, density: 0.15 },
     scan: { cls: 'Rocky (cold desert)', mass: '6.42×10²³ kg', radius: '3,390 km',
             grav: '3.71 m/s²', temp: '−63 °C mean', press: '0.006 bar',
             atmo: [['CO₂', 95], ['N₂', 2.8], ['Ar', 2]] } });
 
-  const jupiter = P({ name: 'Jupiter', type: 'gas', visRadius: radiusScale(69911),
+  // ---- JUPITER: brown/beige/white counter-flowing bands + GRS south ----
+  const jupiter = P({ name: 'Jupiter', type: 'gas', visRadius: logRadius(69911),
     seed: 66, surfaceG: 24.8, spin: 0.06, axialTilt: 3 * D2R,
-    gas: { colA: 0xd8c3a0, colB: 0x9c7a55, colC: 0xefe4cd, bands: 11, storm: true, seed: 6.6 },
-    orbit: els(5.203, 0.0484, 1.3, 15),
+    gas: { colA: 0xe8dcc4, colB: 0x9c6b45, colC: 0xf7f1e2,
+           bands: 12, turb: 0.32, flow: 0.02,
+           storm: true, stormColor: 0xc74a2a, stormLat: -0.32, seed: 6.6 },
+    orbit: els(7.785e8, 5.203, 0.0484, 1.3, 15),
     atmosphere: { color: 0xd9b98a, scale: 1.08, power: 3.5, intensity: 0.9 },
     atmoPhys: { height: 1.1, density: 2.0 },
     scan: { cls: 'Gas giant', mass: '1.90×10²⁷ kg', radius: '69,911 km',
             grav: '24.8 m/s²', temp: '−108 °C (cloud tops)', press: '≫1000 bar (no surface)',
             atmo: [['H₂', 90], ['He', 10]] } });
 
-  ['Io:0.020:0x7', 'Europa:0.030:0x8', 'Ganymede:0.042:0x9', 'Callisto:0.056:0xa']
-    .forEach((s, k) => {
-      const [nm, aStr] = s.split(':');
-      addBody({ name: nm, type: 'rocky', parent: jupiter, systemIndex: sysIdx,
-        visRadius: radiusScale(2000 + k * 350), seed: 100 + k * 7,
-        freq: 3.5, amp: 0.04, ridged: 0.4, craters: 30, seaLevel: null,
-        palette: k === 0
-          ? [{h:0,c:0x8a7a2c},{h:0.6,c:0xc9b13c},{h:1,c:0xe8dd8a}]
-          : [{h:0,c:0x6d7580},{h:0.6,c:0x9aa4ae},{h:1,c:0xd7dde2}],
-        oceanColor: 0, iceCaps: 0, surfaceG: 1.5, spin: 0.004,
-        orbit: els(parseFloat(aStr), 0.005, 1 + k, 60 + k * 90, { periodScale: 0.15 }),
-        scan: { cls: 'Icy/volcanic moon', mass: '≈10²³ kg', radius: '≈2,000 km',
-                grav: '≈1.5 m/s²', temp: '−160 °C', press: '≈ 0',
-                atmo: [['trace', 100]] } });
-    });
+  [['Io', 4.217e5, 1821, 0x8a7a2c, 0xe8dd8a],
+   ['Europa', 6.709e5, 1561, 0x8a8f96, 0xd7dde2],
+   ['Ganymede', 1.0704e6, 2634, 0x6d7580, 0xc4ccd4],
+   ['Callisto', 1.8827e6, 2410, 0x5b5650, 0xa8a098]]
+  .forEach(([nm, dKm, rKm, lo, hi], k) => {
+    addBody({ name: nm, type: 'rocky', parent: jupiter, systemIndex: sysIdx,
+      visRadius: logRadius(rKm), seed: 100 + k * 7,
+      freq: 3.5, amp: 0.04, ridged: 0.4, craters: 35,
+      palette: [{h:0,c:lo},
+        {h:0.6,c:((((lo>>16)+(hi>>16))>>1)<<16)|(((((lo>>8)&255)+((hi>>8)&255))>>1)<<8)|(((lo&255)+(hi&255))>>1)},
+        {h:1,c:hi}],
+      iceCaps: 0, surfaceG: 1.5, spin: 0.004,
+      orbit: els(dKm, 0.003 + k * 0.002, 0.005, 1 + k, 60 + k * 90, { moon: true, periodScale: 30 }),
+      scan: { cls: 'Icy/volcanic moon', mass: '≈10²³ kg', radius: rKm.toLocaleString() + ' km',
+              grav: '≈1.5 m/s²', temp: '−160 °C', press: '≈ 0',
+              atmo: [['trace', 100]] } });
+  });
 
-  const saturn = P({ name: 'Saturn', type: 'gas', visRadius: radiusScale(58232),
+  // ---- SATURN: pale straw, wide thin ice rings that sparkle ----
+  const saturn = P({ name: 'Saturn', type: 'gas', visRadius: logRadius(58232),
     seed: 77, surfaceG: 10.4, spin: 0.055, axialTilt: 26.7 * D2R,
-    gas: { colA: 0xe6d5a8, colB: 0xbfa46e, colC: 0xf4ead0, bands: 8, storm: false, seed: 7.7 },
-    rings: { inner: 1.35, outer: 2.4, colA: 0xd9c8a4, colB: 0x8a7a5c, tilt: 0.05 },
-    orbit: els(9.537, 0.0542, 2.49, 220),
+    gas: { colA: 0xf0e3bb, colB: 0xcbb182, colC: 0xf8f2df,
+           bands: 9, turb: 0.22, flow: 0.014, storm: false, seed: 7.7 },
+    rings: { inner: 1.35, outer: 2.5, colA: 0xefe2c2, colB: 0x9a875f,
+             bright: 0.9, tilt: 0.05 },
+    orbit: els(1.4335e9, 9.537, 0.0542, 2.49, 220),
     atmoPhys: { height: 1.1, density: 1.6 },
     scan: { cls: 'Gas giant (ringed)', mass: '5.68×10²⁶ kg', radius: '58,232 km',
             grav: '10.4 m/s²', temp: '−139 °C', press: '≫1000 bar',
             atmo: [['H₂', 96], ['He', 3]] } });
 
   addBody({ name: 'Titan', type: 'rocky', parent: saturn, systemIndex: sysIdx,
-    visRadius: radiusScale(2575), seed: 130, freq: 2.4, amp: 0.03, ridged: 0.5,
-    craters: 6, seaLevel: 0.0,
+    visRadius: logRadius(2575), seed: 130, freq: 2.4, amp: 0.03, ridged: 0.5,
+    craters: 6, ocean: { level: 0.0, color: 0x2e2a1a, shininess: 60 },
     palette: [{h:0,c:0x7a5a28},{h:0.6,c:0xa8823c},{h:1,c:0xd0ad5e}],
-    oceanColor: 0x3b3220, iceCaps: 0, surfaceG: 1.35, spin: 0.003,
-    orbit: els(0.06, 0.028, 0.3, 10, { periodScale: 0.2 }),
+    iceCaps: 0, surfaceG: 1.35, spin: 0.003,
+    orbit: els(1.2219e6, 0.008, 0.028, 0.3, 10, { moon: true, periodScale: 22 }),
+    clouds: { height: 1.06, colA: 0xd8a24e, colB: 0x8f6a2e,
+              cover: 0.9, scale: 2.5, speed: 0.015 },
     atmosphere: { color: 0xd8a24e, scale: 1.2, power: 3.0, intensity: 1.4 },
     atmoPhys: { height: 1.25, density: 1.4 },
     scan: { cls: 'Moon (dense atmosphere)', mass: '1.35×10²³ kg', radius: '2,575 km',
             grav: '1.35 m/s²', temp: '−179 °C', press: '1.45 bar',
             atmo: [['N₂', 95], ['CH₄', 5]] } });
 
-  P({ name: 'Uranus', type: 'gas', visRadius: radiusScale(25362),
+  // ---- URANUS: featureless smooth cyan, axis tipped on its side ----
+  P({ name: 'Uranus', type: 'gas', visRadius: logRadius(25362),
     seed: 88, surfaceG: 8.7, spin: -0.03, axialTilt: 97.8 * D2R,
-    gas: { colA: 0xaee5e0, colB: 0x6fbdc2, colC: 0xd6f4f0, bands: 4, storm: false, seed: 8.8 },
-    orbit: els(19.19, 0.0472, 0.77, 100),
+    gas: { colA: 0xbdeee8, colB: 0x83cdd1, colC: 0xd9f6f2,
+           bands: 3, turb: 0.06, flow: 0.004, storm: false, seed: 8.8 }, // methane-smooth
+    orbit: els(2.877e9, 19.19, 0.0472, 0.77, 100),
     atmoPhys: { height: 1.1, density: 1.2 },
     scan: { cls: 'Ice giant', mass: '8.68×10²⁵ kg', radius: '25,362 km',
             grav: '8.69 m/s²', temp: '−197 °C', press: '≫1000 bar',
             atmo: [['H₂', 83], ['He', 15], ['CH₄', 2]] } });
 
-  P({ name: 'Neptune', type: 'gas', visRadius: radiusScale(24622),
+  // ---- NEPTUNE: deep blue, white streaks, Great Dark Spot ----
+  P({ name: 'Neptune', type: 'gas', visRadius: logRadius(24622),
     seed: 99, surfaceG: 11.15, spin: 0.035, axialTilt: 28 * D2R,
-    gas: { colA: 0x5d86e8, colB: 0x2c4bb0, colC: 0x9cb8f2, bands: 6, storm: false, seed: 9.9 },
-    orbit: els(30.07, 0.0086, 1.77, 260),
+    gas: { colA: 0x3f6ad4, colB: 0x1e3a96, colC: 0xf0f5ff,   // white wisps
+           bands: 6, turb: 0.28, flow: 0.03,
+           storm: true, stormColor: 0x101f52, stormLat: -0.25, seed: 9.9 }, // dark spot
+    orbit: els(4.503e9, 30.07, 0.0086, 1.77, 260),
     atmoPhys: { height: 1.1, density: 1.3 },
     scan: { cls: 'Ice giant', mass: '1.02×10²⁶ kg', radius: '24,622 km',
             grav: '11.15 m/s²', temp: '−201 °C', press: '≫1000 bar',
             atmo: [['H₂', 80], ['He', 19], ['CH₄', 1]] } });
 
-  // ---- Asteroid belt: instanced rendering, 1600 rocks Mars↔Jupiter ----
+  // ---- Asteroid belt: instanced, between Mars (~6.3k) & Jupiter (~9.5k)
   const beltGeo = new THREE.IcosahedronGeometry(1, 0);
   const beltMat = new THREE.MeshStandardMaterial({ color: 0x8d8378, roughness: 1 });
   const belt = new THREE.InstancedMesh(beltGeo, beltMat, 1600);
   const dummy = new THREE.Object3D();
   const brand = mulberry32(4242);
   for (let i = 0; i < 1600; i++) {
-    const a = (2.1 + brand() * 1.2) * AU;
+    const a = 6900 + brand() * 2100;
     const th = brand() * Math.PI * 2;
-    dummy.position.set(
-      Math.cos(th) * a,
-      (brand() - 0.5) * 60,
-      Math.sin(th) * a);
+    dummy.position.set(Math.cos(th) * a, (brand() - 0.5) * 90, Math.sin(th) * a);
     dummy.rotation.set(brand()*6, brand()*6, brand()*6);
     dummy.scale.setScalar(0.6 + brand() * 2.4);
     dummy.updateMatrix();
@@ -845,7 +934,7 @@ function buildSolarSystem() {
 }
 
 /* =====================================================================
-   7. PROCEDURAL STAR SYSTEMS (seeded generation)
+   7. PROCEDURAL STAR SYSTEMS (log-scaled)
    ===================================================================== */
 const NAME_A = ['Kel','Vor','Ash','Tyr','Nyx','Ori','Zeh','Cal','Umb','Rho'];
 const NAME_B = ['aris','onis','eth','ara','ion','umis','yra','antor','eus','ix'];
@@ -860,11 +949,11 @@ function buildProceduralSystem(seed, originVec) {
   const starHue = rand();
   const hot  = starHue < 0.33 ? 0xcfe0ff : starHue < 0.66 ? 0xfff3b0 : 0xffd9a8;
   const cool = starHue < 0.33 ? 0x6f9dff : starHue < 0.66 ? 0xff8c1c : 0xd94f1e;
-  const starR = radiusScale(400000 + rand() * 600000) * 0.55;
 
   const star = addBody({
     name: starName, type: 'star', systemIndex: sysIdx,
-    visRadius: starR, surfaceG: 30 + rand() * 30, spin: 0.002,
+    visRadius: logRadius(300000 + rand() * 700000),
+    surfaceG: 30 + rand() * 30, spin: 0.002,
     hot, cool, lightColor: hot,
     scan: { cls: 'Main-sequence star (procedural)', mass: (0.4+rand()*2).toFixed(2)+' M☉',
             radius: '—', grav: '—', temp: (3000 + Math.floor(rand()*5000)) + ' K', press: '—',
@@ -876,6 +965,7 @@ function buildProceduralSystem(seed, originVec) {
   let firstRock = null;
   for (let p = 0; p < nPl; p++) {
     const aAU = 0.4 + p * (0.5 + rand() * 0.9);
+    const distKm = aAU * KM_PER_AU;
     const isGas = aAU > 2.2 && rand() < 0.65;
     const nm = genName(rand);
     if (isGas) {
@@ -883,13 +973,15 @@ function buildProceduralSystem(seed, originVec) {
       const c2 = c1.clone().offsetHSL(0.04, 0, -0.25);
       const c3 = c1.clone().offsetHSL(-0.03, 0, 0.2);
       addBody({ name: nm, type: 'gas', parent: star, systemIndex: sysIdx,
-        visRadius: radiusScale(30000 + rand() * 45000),
+        visRadius: logRadius(30000 + rand() * 45000),
         surfaceG: 8 + rand() * 18, spin: 0.03 + rand()*0.04,
         gas: { colA: c1.getHex(), colB: c2.getHex(), colC: c3.getHex(),
-               bands: 4 + Math.floor(rand()*9), storm: rand() < 0.4, seed: rand()*20 },
+               bands: 4 + Math.floor(rand()*9), turb: 0.1 + rand()*0.3,
+               flow: 0.005 + rand()*0.03, storm: rand() < 0.4,
+               stormColor: 0xc74a2a, stormLat: -0.4 + rand()*0.8, seed: rand()*20 },
         rings: rand() < 0.45 ? { inner: 1.3, outer: 2.0 + rand(),
-               colA: c3.getHex(), colB: c2.getHex(), tilt: rand()*0.3 } : null,
-        orbit: els(aAU, rand()*0.1, rand()*6, rand()*360),
+               colA: c3.getHex(), colB: c2.getHex(), bright: rand(), tilt: rand()*0.3 } : null,
+        orbit: els(distKm, aAU, rand()*0.1, rand()*6, rand()*360),
         atmoPhys: { height: 1.1, density: 1.5 },
         scan: { cls: 'Gas giant (procedural)', mass: (0.1+rand()*3).toFixed(2)+' Mʲ',
                 radius: '—', grav: (8+rand()*18).toFixed(1)+' m/s²',
@@ -901,17 +993,22 @@ function buildProceduralSystem(seed, originVec) {
       const mid  = base.clone().offsetHSL(0.02, 0, 0.12);
       const high = base.clone().offsetHSL(0.04, -0.1, 0.3);
       const hasAtmo = rand() < 0.5;
+      const hasOcean = hasAtmo && rand() < 0.5;
       const g = 2 + rand() * 12;
       const rock = addBody({ name: nm, type: 'rocky', parent: star, systemIndex: sysIdx,
-        visRadius: radiusScale(2000 + rand() * 7000),
+        visRadius: logRadius(2000 + rand() * 7000),
         seed: seed * 13 + p * 101, freq: 2 + rand() * 2.5,
         amp: 0.03 + rand() * 0.06, ridged: rand(), craters: Math.floor(rand() * 70),
-        seaLevel: hasAtmo && rand() < 0.5 ? 0.01 : null,
+        ocean: hasOcean ? { level: 0.01,
+          color: new THREE.Color().setHSL((hue+0.5)%1, 0.5, 0.3).getHex(),
+          shininess: 100 } : null,
         palette: [{h:0,c:base.getHex()},{h:0.55,c:mid.getHex()},{h:1,c:high.getHex()}],
-        oceanColor: new THREE.Color().setHSL((hue+0.5)%1, 0.5, 0.3).getHex(),
         iceCaps: rand() < 0.4 ? 0.85 : 0,
         surfaceG: g, spin: 0.01 + rand()*0.03,
-        orbit: els(aAU, rand()*0.15, rand()*8, rand()*360),
+        orbit: els(distKm, aAU, rand()*0.15, rand()*8, rand()*360),
+        clouds: hasAtmo && rand() < 0.6 ? { height: 1.04,
+          colA: 0xffffff, colB: 0xa9b6c6, cover: 0.3 + rand()*0.3,
+          scale: 2.5 + rand()*2, speed: 0.01 + rand()*0.02 } : null,
         atmosphere: hasAtmo ? { color: new THREE.Color().setHSL(rand(),0.6,0.6).getHex(),
                                 scale: 1.15, power: 3.2, intensity: 1.2 } : null,
         atmoPhys: hasAtmo ? { height: 1.2, density: 0.3 + rand() } : null,
@@ -936,7 +1033,7 @@ function buildProceduralSystem(seed, originVec) {
 }
 
 /* =====================================================================
-   8. SPACESHIP — mesh, Newtonian physics, controls
+   8. SPACESHIP v2 — mesh (small vs the giant planets), speed modes
    ===================================================================== */
 function buildShip() {
   const g = new THREE.Group();
@@ -948,11 +1045,9 @@ function buildShip() {
   fus.rotation.x = -Math.PI / 2; g.add(fus);
   const cabin = new THREE.Mesh(new THREE.SphereGeometry(0.55, 12, 10), glassMat);
   cabin.position.set(0, 0.35, -0.4); g.add(cabin);
-  const wingGeo = new THREE.BoxGeometry(4.2, 0.08, 1.4);
-  const wing = new THREE.Mesh(wingGeo, darkMat);
+  const wing = new THREE.Mesh(new THREE.BoxGeometry(4.2, 0.08, 1.4), darkMat);
   wing.position.set(0, -0.1, 1.0); g.add(wing);
-  const finGeo = new THREE.BoxGeometry(0.08, 1.2, 1.0);
-  const fin = new THREE.Mesh(finGeo, darkMat);
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(0.08, 1.2, 1.0), darkMat);
   fin.position.set(0, 0.6, 1.4); g.add(fin);
   [-1, 1].forEach(s => {
     const eng = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.34, 1.3, 10), darkMat);
@@ -960,7 +1055,6 @@ function buildShip() {
     eng.position.set(s * 1.5, -0.1, 1.6);
     g.add(eng);
   });
-  // engine flame sprites
   const flameTex = makeGlowTexture('rgba(180,230,255,1)', 'rgba(60,120,255,0.5)');
   const flames = [];
   [-1.5, 1.5, 0].forEach(x => {
@@ -971,12 +1065,12 @@ function buildShip() {
     f.scale.setScalar(0.001);
     g.add(f); flames.push(f);
   });
-  // re-entry glow shell
   const burn = new THREE.Mesh(
     new THREE.SphereGeometry(3.4, 16, 12),
     new THREE.MeshBasicMaterial({ color: 0xff6a1c, transparent: true, opacity: 0,
       blending: THREE.AdditiveBlending, depthWrite: false }));
   g.add(burn);
+  g.scale.setScalar(0.5);   // keep the ship tiny — planets should feel colossal
   scene.add(g);
   return { group: g, flames, burn };
 }
@@ -988,16 +1082,28 @@ const ship = {
   quat: new THREE.Quaternion(),
   fuel: 100, hull: 100, shield: 100,
   throttle: 0,
+  warpDrive: false,
   landedOn: null,
   landLocal: new THREE.Vector3(),
   lastHitT: -99,
   dead: false
 };
 
-const THRUST_ACCEL = 42;       // u/s²
-const BOOST_MULT = 9;
-const ROT_SPEED = 1.6;         // rad/s
-const SAFE_LANDING_V = 22;     // u/s
+/* -------- Speed modes ------------------------------------------------
+   NORMAL : gentle thrust, low cap — precision flying & landings
+   TURBO  : hold SHIFT — cruise between moons of one system
+   WARP   : press F or J — hyper-cruise between planets, FOV stretch
+   Releasing thrust engages linear damping: velocity eases back toward
+   the local reference frame (nearest body if close, else rest).      */
+const MODES = {
+  NORMAL: { accel: 30,   max: 60,    damp: 1.4, fuelRate: 1.0 },
+  TURBO:  { accel: 380,  max: 1500,  damp: 0.9, fuelRate: 3.0 },
+  WARP:   { accel: 6000, max: 24000, damp: 0.0, fuelRate: 5.0 }
+};
+const ROT_SPEED = 1.6;
+const SAFE_LANDING_V = 25;
+const BRAKE_DAMP = 4.5;              // SPACE — hard brake
+const WARP_DROP_RADII = 8;           // auto-exit warp this close to a body
 
 const keys = {};
 window.addEventListener('keydown', e => {
@@ -1005,6 +1111,7 @@ window.addEventListener('keydown', e => {
   if (e.code === 'KeyT') scanNearest();
   if (e.code === 'KeyN') jumpNextSystem();
   if (e.code === 'KeyH') document.getElementById('controls').classList.toggle('hidden');
+  if (e.code === 'KeyF' || e.code === 'KeyJ') toggleWarpDrive();
   if (/^Digit[1-5]$/.test(e.code)) {
     warpIndex = parseInt(e.code.slice(5), 10) - 1;
     ui.warp.textContent = '×' + WARP_STEPS[warpIndex];
@@ -1013,13 +1120,31 @@ window.addEventListener('keydown', e => {
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 
+function toggleWarpDrive() {
+  if (ship.dead || ship.landedOn) return;
+  if (!ship.warpDrive && ship.fuel < 5) { flashFlag('flag-warn', 1.2); return; }
+  ship.warpDrive = !ship.warpDrive;
+}
+
+function currentMode() {
+  if (ship.warpDrive) return MODES.WARP;
+  if (keys['ShiftLeft'] || keys['ShiftRight']) return MODES.TURBO;
+  return MODES.NORMAL;
+}
+function currentModeName() {
+  if (ship.warpDrive) return 'WARP DRIVE';
+  if (keys['ShiftLeft'] || keys['ShiftRight']) return 'TURBO';
+  return 'NORMAL';
+}
+
+let currentSystem = 0;
 function respawn() {
   const sys = systems[currentSystem];
   ship.pos.copy(sys.spawn());
   ship.vel.set(0, 0, 0);
   ship.quat.identity();
   ship.fuel = 100; ship.hull = 100; ship.shield = 100;
-  ship.landedOn = null; ship.dead = false;
+  ship.landedOn = null; ship.dead = false; ship.warpDrive = false;
   document.getElementById('gameover').classList.add('hidden');
 }
 document.getElementById('respawn').addEventListener('click', () => {
@@ -1028,7 +1153,6 @@ document.getElementById('respawn').addEventListener('click', () => {
   respawn();
 });
 
-let currentSystem = 0;
 function jumpNextSystem() {
   if (ship.dead) return;
   if (ship.fuel < 20) return flashFlag('flag-warn', 1.2);
@@ -1037,12 +1161,12 @@ function jumpNextSystem() {
   const sys = systems[currentSystem];
   ship.pos.copy(sys.spawn());
   ship.vel.set(0, 0, 0);
-  ship.landedOn = null;
+  ship.landedOn = null; ship.warpDrive = false;
   ui.system.textContent = sys.name;
 }
 
 /* =====================================================================
-   9. HUD BINDINGS
+   9. HUD BINDINGS (+ dynamically injected MODE row & new key help)
    ===================================================================== */
 const ui = {
   fuelF: document.getElementById('fuel-fill'), fuelV: document.getElementById('fuel-val'),
@@ -1060,6 +1184,25 @@ const ui = {
   scanner: document.getElementById('scanner')
 };
 let warpIndex = 0;
+
+// MODE row injected above VEL
+(function injectModeRow() {
+  const nav = document.getElementById('navpanel');
+  const row = document.createElement('div');
+  row.className = 'row';
+  row.innerHTML = '<label>MODE</label><span id="mode-val" class="mono">NORMAL</span>';
+  nav.insertBefore(row, nav.firstChild);
+  ui.mode = document.getElementById('mode-val');
+})();
+
+// key help updated to the v2 control scheme
+document.getElementById('controls').innerHTML =
+  '<span><b>W/S</b> thrust</span><span><b>A/D</b> yaw</span>' +
+  '<span><b>↑/↓</b> pitch</span><span><b>Q/E</b> roll</span>' +
+  '<span><b>SHIFT</b> turbo</span><span><b>F/J</b> warp drive</span>' +
+  '<span><b>SPACE</b> brake</span><span><b>T</b> scan</span>' +
+  '<span><b>1–5</b> time warp</span><span><b>N</b> next system</span>' +
+  '<span><b>H</b> hide help</span>';
 
 const flagTimers = {};
 function flashFlag(id, sec) {
@@ -1101,7 +1244,6 @@ function nearestBody() {
   return best;
 }
 
-// projected DOM labels for nearby bodies
 const labelPool = [];
 for (let i = 0; i < 8; i++) {
   const el = document.createElement('div');
@@ -1131,23 +1273,25 @@ function updateLabels() {
   });
 }
 function fmtDist(d) {
-  if (d > AU * 0.5) return (d / AU).toFixed(2) + ' AU';
   if (d > 1000) return (d / 1000).toFixed(1) + ' ku';
   return Math.round(d) + ' u';
 }
 
 /* =====================================================================
-   10. PHYSICS STEP — Newtonian inertia, n-body gravity, drag, landing
+   10. PHYSICS v2 — delta-time Euler integration, linear damping,
+       speed caps per mode, n-body gravity, drag, warp auto-drop
    ===================================================================== */
 const _tmpV = new THREE.Vector3();
 const _tmpV2 = new THREE.Vector3();
-const _fwd = new THREE.Vector3();
-const _up = new THREE.Vector3();
+const _refVel = new THREE.Vector3();
+const _relV = new THREE.Vector3();
+const _fwd = new THREE.Vector3(0, 0, -1);
+const _up = new THREE.Vector3(0, 1, 0);
 
 function physicsStep(dt) {
   if (ship.dead) return;
 
-  // ---- rotation (torque-free attitude control, instant response) ----
+  // ---- attitude ----
   const rq = new THREE.Quaternion();
   if (keys['KeyA'])      { rq.setFromAxisAngle(new THREE.Vector3(0,1,0),  ROT_SPEED*dt); ship.quat.multiply(rq); }
   if (keys['KeyD'])      { rq.setFromAxisAngle(new THREE.Vector3(0,1,0), -ROT_SPEED*dt); ship.quat.multiply(rq); }
@@ -1156,108 +1300,146 @@ function physicsStep(dt) {
   if (keys['KeyQ'])      { rq.setFromAxisAngle(new THREE.Vector3(0,0,1),  ROT_SPEED*dt); ship.quat.multiply(rq); }
   if (keys['KeyE'])      { rq.setFromAxisAngle(new THREE.Vector3(0,0,1), -ROT_SPEED*dt); ship.quat.multiply(rq); }
   ship.quat.normalize();
-
   _fwd.set(0, 0, -1).applyQuaternion(ship.quat);
 
-  // ---- landed state: ride the planet, refuel, wait for takeoff ----
+  // ---- landed: ride the planet, refuel, W = take off ----
   if (ship.landedOn) {
     const b = ship.landedOn;
     _tmpV.copy(ship.landLocal).applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()));
-    ship.pos.copy(b.position).addScaledVector(_tmpV.normalize(), b.visRadius + 1.6);
+    ship.pos.copy(b.position).addScaledVector(_tmpV.normalize(), b.visRadius + 0.9);
     ship.vel.copy(b.velocity);
     ship.fuel = Math.min(100, ship.fuel + 6 * dt);
     ship.hull = Math.min(100, ship.hull + 2 * dt);
     ui.fLand.classList.remove('hidden');
-    if (keys['KeyW'] && ship.fuel > 0.5) {          // take off
+    if (keys['KeyW'] && ship.fuel > 0.5) {
       ship.landedOn = null;
       _tmpV2.copy(ship.pos).sub(b.position).normalize();
-      ship.vel.addScaledVector(_tmpV2, 30);
+      ship.vel.addScaledVector(_tmpV2, 25);
       ui.fLand.classList.add('hidden');
     }
     return;
   }
   ui.fLand.classList.add('hidden');
 
-  // ---- thrust (consumes fuel; nothing decelerates you but physics) ----
-  ship.throttle = 0;
-  const boosting = keys['Space'];
-  const mult = boosting ? BOOST_MULT : 1;
-  if (ship.fuel > 0) {
-    if (keys['KeyW']) {
-      ship.vel.addScaledVector(_fwd, THRUST_ACCEL * mult * dt);
-      ship.fuel -= (boosting ? 6 : 1.1) * dt;
-      ship.throttle = boosting ? 1 : 0.55;
-    }
-    if (keys['KeyS']) {
-      ship.vel.addScaledVector(_fwd, -THRUST_ACCEL * 0.6 * dt);
-      ship.fuel -= 0.8 * dt;
-      ship.throttle = Math.max(ship.throttle, 0.3);
-    }
-    if (keys['ShiftLeft'] || keys['ShiftRight']) {  // retro-thrusters: burn against v
-      const sp = ship.vel.length();
-      if (sp > 0.01) {
-        const dec = Math.min(sp, THRUST_ACCEL * 1.4 * dt);
-        ship.vel.addScaledVector(_tmpV.copy(ship.vel).normalize(), -dec);
-        ship.fuel -= 0.9 * dt;
-        ship.throttle = Math.max(ship.throttle, 0.4);
-      }
-    }
-    ship.fuel = Math.max(0, ship.fuel);
+  // ---- local reference frame: nearest body's velocity when close ----
+  const nb = nearestBody();
+  if (nb && ship.pos.distanceTo(nb.position) < nb.visRadius * 60) {
+    _refVel.copy(nb.velocity);
+  } else {
+    _refVel.set(0, 0, 0);
   }
 
-  // ---- n-body gravity (gravity-assist slingshots emerge naturally) ----
+  // ---- thrust / warp / damping ----
+  const mode = currentMode();
+  ship.throttle = 0;
+  let thrusting = false;
+
+  if (ship.warpDrive) {
+    if (ship.fuel <= 0) ship.warpDrive = false;
+    else {
+      // warp drive thrusts forward continuously
+      ship.vel.addScaledVector(_fwd, mode.accel * dt);
+      ship.fuel = Math.max(0, ship.fuel - mode.fuelRate * dt);
+      ship.throttle = 1;
+      thrusting = true;
+      // auto-drop near any body — prevents warping into a planet
+      if (nb && ship.pos.distanceTo(nb.position) < nb.visRadius * WARP_DROP_RADII) {
+        ship.warpDrive = false;
+      }
+    }
+  } else if (ship.fuel > 0) {
+    if (keys['KeyW']) {
+      ship.vel.addScaledVector(_fwd, mode.accel * dt);
+      ship.fuel = Math.max(0, ship.fuel - mode.fuelRate * dt);
+      ship.throttle = mode === MODES.TURBO ? 1 : 0.55;
+      thrusting = true;
+    }
+    if (keys['KeyS']) {
+      ship.vel.addScaledVector(_fwd, -mode.accel * 0.6 * dt);
+      ship.fuel = Math.max(0, ship.fuel - mode.fuelRate * 0.7 * dt);
+      ship.throttle = Math.max(ship.throttle, 0.3);
+      thrusting = true;
+    }
+  }
+
+  // relative velocity in the local frame
+  _relV.copy(ship.vel).sub(_refVel);
+  const relSpeed = _relV.length();
+
+  // hard brake (SPACE) — exponential decay toward local rest
+  if (keys['Space'] && ship.fuel > 0) {
+    const k = 1 - Math.exp(-BRAKE_DAMP * dt);
+    ship.vel.addScaledVector(_relV, -k);
+    ship.fuel = Math.max(0, ship.fuel - 0.6 * dt);
+    ship.throttle = Math.max(ship.throttle, 0.4);
+    _relV.copy(ship.vel).sub(_refVel);
+  }
+  // LINEAR DAMPING: release the throttle and the ship eases to a stop
+  else if (!thrusting && mode.damp > 0 && relSpeed > 0.01) {
+    const k = 1 - Math.exp(-mode.damp * dt);
+    ship.vel.addScaledVector(_relV, -k);
+    _relV.copy(ship.vel).sub(_refVel);
+  }
+
+  // per-mode speed cap (soft clamp so gravity assists still add punch)
+  const sp = _relV.length();
+  if (sp > mode.max) {
+    const k = Math.min(1, 3 * dt) * (1 - mode.max / sp);
+    ship.vel.addScaledVector(_relV, -k);
+  }
+
+  // ---- n-body gravity ----
   let gPull = 0;
   let atmoBody = null, atmoDensity = 0;
   for (const b of bodies) {
     if (b.systemIndex !== currentSystem || b.mu === 0) continue;
     _tmpV.copy(b.position).sub(ship.pos);
     const r = _tmpV.length();
-    if (r > b.visRadius * 120) continue;            // sphere of influence cutoff
+    if (r > b.visRadius * 120) continue;
     const a = b.mu / (r * r);
     ship.vel.addScaledVector(_tmpV.normalize(), a * dt);
     gPull += a;
 
-    // atmosphere check
     if (b.atmo && r < b.visRadius * b.atmo.height) {
       const alt01 = (r - b.visRadius) / (b.visRadius * (b.atmo.height - 1));
       atmoDensity = b.atmo.density * Math.exp(-Math.max(0, alt01) * 4);
       atmoBody = b;
     }
 
-    // ---- surface collision / landing ----
-    if (r < b.visRadius + 1.6) {
+    if (r < b.visRadius + 0.9) {
       const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
       const speed = relV.length();
       if (b.type === 'star') { damage(200 * dt + 50); }
       else if (speed <= SAFE_LANDING_V) {
         ship.landedOn = b;
+        ship.warpDrive = false;
         ship.landLocal.copy(ship.pos).sub(b.position)
           .applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
       } else {
         damage((speed - SAFE_LANDING_V) * 1.6);
-        // bounce: reflect relative velocity off the surface normal
         const n = _tmpV.copy(ship.pos).sub(b.position).normalize();
         const vn = relV.dot(n);
         relV.addScaledVector(n, -1.7 * vn);
         ship.vel.copy(b.velocity).addScaledVector(relV, 0.55);
-        ship.pos.copy(b.position).addScaledVector(n, b.visRadius + 2.0);
+        ship.pos.copy(b.position).addScaledVector(n, b.visRadius + 1.4);
       }
     }
   }
   ui.grav.textContent = gPull.toFixed(2);
-  if (gPull > 25) flashFlag('flag-warn', 0.3); 
+  if (gPull > 25) flashFlag('flag-warn', 0.3);
 
   // ---- atmospheric drag + re-entry burn ----
   let burning = 0;
   if (atmoBody) {
     ui.fAtmo.classList.remove('hidden');
     const relV = _tmpV2.copy(ship.vel).sub(atmoBody.velocity);
-    const sp = relV.length();
-    const drag = 0.0025 * atmoDensity * sp;         // a = k·ρ·v² (per unit v)
+    const spd = relV.length();
+    const drag = 0.0025 * atmoDensity * spd;
     ship.vel.addScaledVector(relV, -Math.min(0.9, drag * dt));
-    if (sp > 90) {
-      burning = THREE.MathUtils.clamp((sp - 90) / 160, 0, 1) * atmoDensity;
+    if (spd > 70) {
+      burning = THREE.MathUtils.clamp((spd - 70) / 140, 0, 1) * atmoDensity;
       damage(burning * 9 * dt);
+      ship.warpDrive = false;
     }
   } else {
     ui.fAtmo.classList.add('hidden');
@@ -1271,7 +1453,7 @@ function physicsStep(dt) {
     ship.shield = Math.min(100, ship.shield + 1.6 * dt);
   }
 
-  // ---- integrate (pure inertia in vacuum — Newton's first law) ----
+  // ---- Euler integration: x += v·dt (delta-time, FPS-independent) ----
   ship.pos.addScaledVector(ship.vel, dt);
 }
 
@@ -1284,18 +1466,16 @@ function damage(amount) {
   }
   ship.hull -= amount;
   if (ship.hull <= 0 && !ship.dead) {
-    ship.hull = 0; ship.dead = true;
+    ship.hull = 0; ship.dead = true; ship.warpDrive = false;
     document.getElementById('gameover').classList.remove('hidden');
   }
 }
 
 /* =====================================================================
-   11. MAIN LOOP
+   11. MAIN LOOP — THREE.Clock delta time, LERP chase camera, FOV stretch
    ===================================================================== */
-let simTime = 0;        // orbital time (warped)
-let perfTime = 0;       // real seconds
-let lastFrame = performance.now();
-const _sunPos = new THREE.Vector3();
+let simTime = 0;
+let perfTime = 0;
 const camTarget = new THREE.Vector3();
 const camPos = new THREE.Vector3();
 
@@ -1313,46 +1493,44 @@ function updateBodies(dt) {
     b.group.position.copy(b.position);
     if (dt > 0) b.velocity.copy(b.position).sub(b._prevPos).divideScalar(dt);
     b.mesh.rotation.y += b.spin * dt * Math.min(warp, 50);
-    // shader uniforms
+    if (b.cloudMesh) {
+      b.cloudMesh.rotation.y += b.spin * 0.7 * dt * Math.min(warp, 50);
+      b.cloudMesh.material.uniforms.uTime.value = perfTime;
+      b.cloudMesh.material.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
+    }
     if (b.gasMat) {
       b.gasMat.uniforms.uTime.value = perfTime;
-      const star = systems[b.systemIndex].star;
-      b.gasMat.uniforms.uSunPos.value.copy(star.position);
+      b.gasMat.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
     }
-    if (b.type === 'star') {
-      b.mesh.material.uniforms.uTime.value = perfTime;
-    }
-    if (b._atmoMat) {
-      const star = systems[b.systemIndex].star;
-      b._atmoMat.uniforms.uSunPos.value.copy(star.position);
-    }
+    if (b.type === 'star') b.mesh.material.uniforms.uTime.value = perfTime;
+    if (b._atmoMat) b._atmoMat.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
   }
-  // asteroid belt slow revolution
-  if (systems[0].belt) systems[0].belt.rotation.y += 0.002 * dt * Math.min(warp, 50);
+  if (systems[0] && systems[0].belt)
+    systems[0].belt.rotation.y += 0.002 * dt * Math.min(warp, 50);
 }
 
 function updateCamera(dt) {
   shipVisual.group.position.copy(ship.pos);
   shipVisual.group.quaternion.copy(ship.quat);
-  // engine flames scale with throttle
   shipVisual.flames.forEach(f => {
-    const s = ship.throttle * (1.2 + Math.random() * 0.5);
+    const s = ship.throttle * (1.2 + Math.random() * 0.5) * (ship.warpDrive ? 2.2 : 1);
     f.scale.setScalar(Math.max(0.001, s));
   });
-  // chase camera
+  // LERP chase camera — smooth, judder-free follow
   _up.set(0, 1, 0).applyQuaternion(ship.quat);
   camTarget.copy(ship.pos)
-    .add(_tmpV.set(0, 3.2, 11.5).applyQuaternion(ship.quat));
+    .add(_tmpV.set(0, 1.9, 7).applyQuaternion(ship.quat));
   const k = 1 - Math.pow(0.0015, dt);
   camPos.lerp(camTarget, k);
   camera.position.copy(camPos);
   camera.up.copy(_up);
   camera.lookAt(_tmpV.copy(ship.pos).addScaledVector(_fwd, 30));
-  // subtle FOV kick with speed
-  const targetFov = 62 + Math.min(14, ship.vel.length() * 0.012);
-  camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 3);
+  // FOV stretch: warp drive pulls the view wide for a smooth hyperspace feel
+  const speedKick = Math.min(10, ship.vel.length() * 0.006);
+  const targetFov = ship.warpDrive ? 96 : 62 + speedKick;
+  camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 2.5);
   camera.updateProjectionMatrix();
-  starfield.position.copy(camera.position); // keep sky infinitely far
+  starfield.position.copy(camera.position);
 }
 
 function updateHUD() {
@@ -1361,6 +1539,8 @@ function updateHUD() {
   ui.shF.style.width = ship.shield + '%';  ui.shV.textContent = Math.round(ship.shield) + '%';
   ui.vel.textContent = ship.vel.length().toFixed(1);
   ui.thr.textContent = Math.round(ship.throttle * 100) + '%';
+  ui.mode.textContent = currentModeName();
+  ui.mode.style.color = ship.warpDrive ? 'var(--amber)' : '';
   const nb = nearestBody();
   if (nb) {
     ui.nearName.textContent = nb.name;
@@ -1377,14 +1557,12 @@ function updateHUD() {
 let frameCount = 0;
 function animate() {
   requestAnimationFrame(animate);
-  const now = performance.now();
-  let dt = Math.min(0.05, (now - lastFrame) / 1000); // clamp to avoid tunneling
-  lastFrame = now;
+  // THREE.Clock delta — ship speed identical on 30, 60 or 144 FPS rigs
+  const dt = Math.min(0.05, clock.getDelta());
   perfTime += dt;
 
   updateBodies(dt);
-  // substep physics for stability near planets
-  const sub = 2;
+  const sub = 2;                    // physics substeps for stability
   for (let s = 0; s < sub; s++) physicsStep(dt / sub);
   updateCamera(dt);
 
@@ -1395,7 +1573,7 @@ function animate() {
 }
 
 /* =====================================================================
-   12. BOOTSTRAP — staged generation with loading feedback
+   12. BOOTSTRAP
    ===================================================================== */
 const loaderFill = document.getElementById('loader-fill');
 const loaderStatus = document.getElementById('loader-status');
@@ -1407,7 +1585,7 @@ const buildSteps = [
   ['Calibrating orbits…', () => { updateBodies(0); updateBodies(0.0001); }],
   ['Launching…', () => {
     respawn();
-    camPos.copy(ship.pos).add(new THREE.Vector3(0, 4, 14));
+    camPos.copy(ship.pos).add(new THREE.Vector3(0, 2, 8));
     document.getElementById('hud').classList.remove('hidden');
   }]
 ];
@@ -1415,14 +1593,13 @@ let stepIdx = 0;
 function runBuildStep() {
   if (stepIdx >= buildSteps.length) {
     document.getElementById('loader').classList.add('fade');
-    lastFrame = performance.now();
+    clock.getDelta();          // discard load time from the first frame
     animate();
     return;
   }
   const [label, fn] = buildSteps[stepIdx];
   loaderStatus.textContent = label;
   loaderFill.style.width = Math.round((stepIdx / buildSteps.length) * 100) + '%';
-  // give the browser a frame to paint the loader text before heavy work
   requestAnimationFrame(() => setTimeout(() => {
     fn();
     stepIdx++;
