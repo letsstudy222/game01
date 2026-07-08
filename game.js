@@ -2019,6 +2019,8 @@ const _tmpV = new THREE.Vector3();
 const _tmpV2 = new THREE.Vector3();
 const _refVel = new THREE.Vector3();
 const _gAcc = new THREE.Vector3();     // gravity accel this step (for flight assist)
+const _radV = new THREE.Vector3();     // radial unit vector (ship ← body)
+const _tanV = new THREE.Vector3();     // tangential velocity component
 const _relV = new THREE.Vector3();
 const _fwd = new THREE.Vector3(0, 0, -1);
 const _up = new THREE.Vector3(0, 1, 0);
@@ -2043,7 +2045,7 @@ function physicsStep(dt) {
     _tmpV.copy(ship.landLocal).applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()));
     _tmpV.normalize();
     _tmpV2.copy(b.position).addScaledVector(_tmpV, b.visRadius + 5);
-    ship.pos.copy(b.position).addScaledVector(_tmpV, b.surfaceRadius(_tmpV2) + 0.9);
+    ship.pos.copy(b.position).addScaledVector(_tmpV, b.surfaceRadius(_tmpV2) + 0.6);
     ship.vel.copy(b.velocity);
     ship.fuel = Math.min(100, ship.fuel + 6 * dt);
     ship.hull = Math.min(100, ship.hull + 2 * dt);
@@ -2143,7 +2145,9 @@ function physicsStep(dt) {
       const reach = b.maxTerrain !== undefined ? b.maxTerrain : b.visRadius * 0.12;
       if (r < b.visRadius + reach + 3) {
         const surfR = b.surfaceRadius(ship.pos);
-        if (r < surfR + 0.9) {
+        // contact EXACTLY at the terrain: base radius + noise height
+        // (+0.6 = the physical half-height of the hull, not padding)
+        if (r <= surfR + 0.6) {
           const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
           const speed = relV.length();
           if (b.type === 'star') { damage(200 * dt + 50); }
@@ -2158,7 +2162,7 @@ function physicsStep(dt) {
             const vn = relV.dot(n);
             relV.addScaledVector(n, -1.7 * vn);
             ship.vel.copy(b.velocity).addScaledVector(relV, 0.55);
-            ship.pos.copy(b.position).addScaledVector(n, surfR + 1.4);
+            ship.pos.copy(b.position).addScaledVector(n, surfR + 0.8);
           }
         }
       }
@@ -2179,31 +2183,50 @@ function physicsStep(dt) {
     ship.throttle = Math.max(ship.throttle, 0.4);
   }
   // ---- LINEAR DAMPING + FLIGHT ASSIST while idle -------------------
+  // RULE (the "invisible shield" fix): near a planet, NOTHING may brake
+  // the ship's inward motion except real physics (drag) and the ground
+  // itself. Auto-friction is therefore ANISOTROPIC — full strength on
+  // tangential + climbing motion (keeps handling crisp), only 15% on
+  // descent, so a coasting approach carries all the way to the surface.
   else if (!thrusting && mode.damp > 0) {
+    const kFull = 1 - Math.exp(-mode.damp * dt);
+    const hasFrame = !!(gb && !observing &&
+      ship.pos.distanceTo(gb.position) < gb.visRadius * 60);
     if (relSpeed > 0.01) {
-      const k = 1 - Math.exp(-mode.damp * dt);
-      ship.vel.addScaledVector(_relV, -k);
+      if (hasFrame) {
+        _radV.copy(ship.pos).sub(gb.position).normalize();
+        const vr = _relV.dot(_radV);
+        _tanV.copy(_relV).addScaledVector(_radV, -vr);   // tangential part
+        ship.vel.addScaledVector(_tanV, -kFull);
+        const kRad = vr < 0 ? 1 - Math.exp(-mode.damp * 0.15 * dt) : kFull;
+        ship.vel.addScaledVector(_radV, -vr * kRad);
+      } else {
+        ship.vel.addScaledVector(_relV, -kFull);
+      }
     }
-    // flight assist: at low relative speed the RCS silently counters
-    // gravity, so a parked ship HOVERS instead of endlessly falling.
-    // Fades out above 30 u/s so gravity slingshots still work.
+    // current radial descent rate (after damping)
+    let vr = 0;
+    if (hasFrame) {
+      vr = _tmpV2.copy(ship.vel).sub(_refVel).dot(_radV);
+    }
+    // flight assist (hover): cancels gravity ONLY while near-stationary
+    // or in a slow controlled descent — a committed dive (vr < −12) is
+    // left entirely to gravity, exactly as Newton intended.
     const assist = THREE.MathUtils.clamp(1 - relSpeed / 30, 0, 1);
-    if (assist > 0) ship.vel.addScaledVector(_gAcc, -assist * dt);
-    // …but the hover must NOT become a wall above the ground: when
-    // idling close to the terrain the assist servos a gentle 6 u/s
-    // descent instead, so the ship glides down and touches the real
-    // surface by itself (6 u/s ≪ SAFE_LANDING_V — always a soft landing)
-    const gbd = gravBody();
-    if (gbd && gbd.type !== 'star') {
-      _tmpV.copy(ship.pos).sub(gbd.position);
-      const dg = _tmpV.length();
-      const reachG = gbd.maxTerrain !== undefined ? gbd.maxTerrain : gbd.visRadius * 0.12;
-      if (dg < gbd.visRadius + reachG + 48) {
-        _tmpV.divideScalar(dg);                       // radial "up"
-        const alt = dg - gbd.surfaceRadius(ship.pos);
+    if (assist > 0 && (!hasFrame || vr > -12)) {
+      ship.vel.addScaledVector(_gAcc, -assist * dt);
+    }
+    // glide servo: DOWNWARD-ONLY. It eases an idle ship into a soft
+    // 6 u/s touchdown but is mathematically incapable of pushing the
+    // ship away from the planet (correction clamped ≤ 0).
+    if (hasFrame && gb.type !== 'star') {
+      const dg = ship.pos.distanceTo(gb.position);
+      const reachG = gb.maxTerrain !== undefined ? gb.maxTerrain : gb.visRadius * 0.12;
+      if (dg < gb.visRadius + reachG + 48) {
+        const alt = dg - gb.surfaceRadius(ship.pos);
         if (alt < 45) {
-          const vr = _tmpV2.copy(ship.vel).sub(_refVel).dot(_tmpV);
-          ship.vel.addScaledVector(_tmpV, (-6 - vr) * Math.min(1, 4 * dt));
+          const c = Math.min(0, -6 - vr);      // never positive = never up
+          ship.vel.addScaledVector(_radV, c * Math.min(1, 4 * dt));
         }
       }
     }
@@ -2401,15 +2424,21 @@ function animate() {
   const observingNow = WARP_STEPS[warpIndex] > 1 && !ship.landedOn && !ship.dead;
   if (wasObserving && !observingNow) {
     syncToLocalFrame();
-    // collisions were suspended during time warp — if a planet swept
-    // through the ship, restore a valid state just above its surface
-    const gb = gravBody();
-    if (gb) {
-      const d = ship.pos.distanceTo(gb.position);
-      const sR = gb.surfaceRadius(ship.pos);
-      if (d < sR + 1.2) {
-        _tmpV.copy(ship.pos).sub(gb.position).normalize();
-        ship.pos.copy(gb.position).addScaledVector(_tmpV, sR + 2.5);
+    // collisions were suspended during time warp (they are re-enabled
+    // statelessly every frame at ×1 — nothing to "switch back on").
+    // If any body swept through the ship while ghosted, restore a
+    // valid state just above that body's real terrain surface.
+    for (const b of bodies) {
+      if (b.systemIndex !== currentSystem || b.mu === 0) continue;
+      const d = ship.pos.distanceTo(b.position);
+      const reach = b.maxTerrain !== undefined ? b.maxTerrain : b.visRadius * 0.12;
+      if (d < b.visRadius + reach + 2) {
+        const sR = b.surfaceRadius(ship.pos);
+        if (d < sR + 1.2) {
+          _tmpV.copy(ship.pos).sub(b.position).normalize();
+          ship.pos.copy(b.position).addScaledVector(_tmpV, sR + 2.0);
+          ship.vel.copy(b.velocity);
+        }
       }
     }
   }
