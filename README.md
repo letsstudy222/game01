@@ -26,7 +26,9 @@ No build step, no server required.
 | `Q` / `E` | Roll |
 | `SHIFT` | Turbo mode (cruise between moons) |
 | `F` / `J` | Warp Drive toggle (hyper-cruise between planets, FOV stretch + star-streaks) |
-| `SPACE` | Hard brake |
+| `SPACE` | Reset view — levels the ship & snaps the camera behind the tail (hold to lock) |
+| `B` | Hard brake |
+| `V` | Toggle chase / cockpit view |
 | `T` | Scan nearest celestial body |
 | `1`–`5` | Time warp ×1 / ×10 / ×50 / ×200 / ×1000 |
 | `N` | Hyperjump to next star system (costs 20% fuel) |
@@ -46,6 +48,10 @@ No build step, no server required.
 - **Camera shake** — sin-oscillator rattle during turbo, warp and re-entry.
 - Post-processing scripts load from jsDelivr; if unavailable the game
   falls back to plain rendering automatically.
+- **Terrain-true collision** — one analytic height function drives both
+  the visible mesh and the physics boundary: fly into valleys, skim
+  mountain ridges, and touch down on the actual ground. Idling below
+  45 u altitude engages a gentle 6 u/s glide that lands the ship itself.
 
 ## What's inside
 - **Kepler orbital mechanics** — real orbital elements (a, e, i) for all 8 planets

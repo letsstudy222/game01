@@ -841,6 +841,8 @@ function keplerPosition(el, simTime, out) {
    ===================================================================== */
 const bodies = [];
 const systems = [];
+const _sfDir = new THREE.Vector3();   // scratch for surfaceRadius()
+const _sfQ = new THREE.Quaternion();
 
 // ---- Rocky planet: noise terrain + craters + optional specular ocean
 //      sphere (Phong sun-glint) + optional lava glow at low elevations
@@ -870,14 +872,16 @@ function buildRockyMesh(cfg) {
   const amp = cfg.amp * r;
   const seaLevel = cfg.ocean ? cfg.ocean.level : null;
 
-  for (let idx = 0; idx < pos.count; idx++) {
-    v.fromBufferAttribute(pos, idx).normalize();
-    let h = fbm(simplex, v.x * cfg.freq, v.y * cfg.freq, v.z * cfg.freq, 6, 2.1, 0.5);
-    const ridge = 1 - Math.abs(fbm(simplex, v.x*cfg.freq*2.3+9, v.y*cfg.freq*2.3, v.z*cfg.freq*2.3, 4, 2.2, 0.5));
+  // ONE analytic terrain function, shared by the mesh displacement AND
+  // the physics collision test — so the hitbox IS the visible ground,
+  // not an oversized invisible sphere floating above the valleys.
+  function heightNorm(d) {
+    let h = fbm(simplex, d.x * cfg.freq, d.y * cfg.freq, d.z * cfg.freq, 6, 2.1, 0.5);
+    const ridge = 1 - Math.abs(fbm(simplex, d.x*cfg.freq*2.3+9, d.y*cfg.freq*2.3, d.z*cfg.freq*2.3, 4, 2.2, 0.5));
     h = h * 0.75 + (ridge * ridge - 0.55) * 0.5 * cfg.ridged;
     for (let c = 0; c < craters.length; c++) {
       const cr = craters[c];
-      const ang = Math.acos(THREE.MathUtils.clamp(v.dot(cr.dir), -1, 1));
+      const ang = Math.acos(THREE.MathUtils.clamp(d.dot(cr.dir), -1, 1));
       if (ang < cr.size * 1.4) {
         const t = ang / cr.size;
         const bowl = t < 1 ? (t * t - 1) : 0;
@@ -885,8 +889,14 @@ function buildRockyMesh(cfg) {
         h += (bowl * 0.8 + rim) * (cr.depth / amp);
       }
     }
+    return h;
+  }
+
+  for (let idx = 0; idx < pos.count; idx++) {
+    v.fromBufferAttribute(pos, idx).normalize();
+    const h = heightNorm(v);
     let hw = h * amp;
-    const hNorm = h;
+    const hNorm = h;   // heightNorm(v) — identical to the physics query
     // emissive lava mask — feeds the bloom pass on Venus basins
     if (cfg.lava && hNorm < -0.22)
       glowAttr[idx] = THREE.MathUtils.clamp((-0.22 - hNorm) * 4, 0, 1);
@@ -950,6 +960,12 @@ function buildRockyMesh(cfg) {
         '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vec3(1.0, 0.32, 0.07) * vGlow * vGlow * 2.6;');
   };
   const mesh = new THREE.Mesh(geo, mat);
+  // physics queries: world-unit surface radius along a LOCAL direction
+  mesh.userData.surfaceFn = (d) => {
+    let hw = heightNorm(d) * amp;
+    if (seaLevel !== null && hw < seaLevel * amp) hw = seaLevel * amp;
+    return r + hw;
+  };
   // Specular ocean: smooth Phong sphere at sea level — the sun glints
   // off it (Earth's "specular map" effect) while land stays matte.
   if (cfg.ocean) {
@@ -1048,6 +1064,16 @@ function addBody(cfg) {
     _atmoMat: cfg._atmoMat || null
   };
   mesh.rotation.z = body.axialTilt;
+  // Terrain-accurate surface radius at a world position. Stars & gas
+  // giants fall back to their sphere radius (their "surface" IS smooth).
+  body.surfaceRadius = function (worldPos) {
+    const f = mesh.userData.surfaceFn;
+    if (!f) return this.visRadius;
+    _sfDir.copy(worldPos).sub(this.position).normalize();
+    mesh.getWorldQuaternion(_sfQ).invert();
+    _sfDir.applyQuaternion(_sfQ);          // into rotating mesh space
+    return f(_sfDir);
+  };
   bodies.push(body);
   return body;
 }
@@ -1429,6 +1455,11 @@ window.addEventListener('keydown', e => {
   if (e.code === 'KeyN') jumpNextSystem();
   if (e.code === 'KeyH') document.getElementById('controls').classList.toggle('hidden');
   if (e.code === 'KeyF' || e.code === 'KeyJ') toggleWarpDrive();
+  if (e.code === 'Space') resetView();
+  if (e.code === 'KeyV') {
+    viewMode = viewMode === 'chase' ? 'cockpit' : 'chase';
+    shipVisual.group.visible = (viewMode === 'chase');
+  }
   if (/^Digit[1-5]$/.test(e.code)) {
     warpIndex = parseInt(e.code.slice(5), 10) - 1;
     ui.warp.textContent = '×' + WARP_STEPS[warpIndex];
@@ -1447,6 +1478,33 @@ window.addEventListener('blur', clearKeys);
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) clearKeys();
 });
+
+/* SPACE — RESET VIEW. Two things happen at once:
+   1. The ship is levelled: its forward direction is kept, but all
+      accumulated roll is removed relative to the local "up" (radial
+      away from the dominant body when near one, world-Y in deep space).
+   2. The chase camera snaps INSTANTLY to the ideal position behind the
+      tail (the smoothing lerp is bypassed for one frame). Holding SPACE
+      keeps the camera rigidly locked there. */
+const _rvM = new THREE.Matrix4();
+const _rvUp = new THREE.Vector3();
+const _rvO = new THREE.Vector3();
+let camSnap = false;
+let viewMode = 'chase';
+function resetView() {
+  if (ship.dead) return;
+  const gb = gravBody();
+  if (gb && ship.pos.distanceTo(gb.position) < gb.visRadius * 60) {
+    _rvUp.copy(ship.pos).sub(gb.position).normalize();
+  } else {
+    _rvUp.set(0, 1, 0);
+  }
+  _fwd.set(0, 0, -1).applyQuaternion(ship.quat);
+  if (Math.abs(_fwd.dot(_rvUp)) > 0.97) _rvUp.set(1, 0, 0);  // degenerate
+  _rvM.lookAt(_rvO.set(0, 0, 0), _fwd, _rvUp);   // -Z stays on course
+  ship.quat.setFromRotationMatrix(_rvM);
+  camSnap = true;
+}
 
 function toggleWarpDrive() {
   if (ship.dead || ship.landedOn) return;
@@ -1546,7 +1604,8 @@ document.getElementById('controls').innerHTML =
   '<span><b>W/S</b> thrust</span><span><b>A/D</b> yaw</span>' +
   '<span><b>↑/↓</b> pitch</span><span><b>Q/E</b> roll</span>' +
   '<span><b>SHIFT</b> turbo</span><span><b>F/J</b> warp drive</span>' +
-  '<span><b>SPACE</b> brake</span><span><b>T</b> scan</span>' +
+  '<span><b>SPACE</b> reset view</span><span><b>B</b> brake</span>' +
+  '<span><b>V</b> cockpit</span><span><b>T</b> scan</span>' +
   '<span><b>1–5</b> time warp</span><span><b>N</b> next system</span>' +
   '<span><b>H</b> hide help</span>';
 
@@ -1668,7 +1727,9 @@ function physicsStep(dt) {
   if (ship.landedOn) {
     const b = ship.landedOn;
     _tmpV.copy(ship.landLocal).applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()));
-    ship.pos.copy(b.position).addScaledVector(_tmpV.normalize(), b.visRadius + 0.9);
+    _tmpV.normalize();
+    _tmpV2.copy(b.position).addScaledVector(_tmpV, b.visRadius + 5);
+    ship.pos.copy(b.position).addScaledVector(_tmpV, b.surfaceRadius(_tmpV2) + 0.9);
     ship.vel.copy(b.velocity);
     ship.fuel = Math.min(100, ship.fuel + 6 * dt);
     ship.hull = Math.min(100, ship.hull + 2 * dt);
@@ -1709,7 +1770,7 @@ function physicsStep(dt) {
 
   if (ship.warpDrive) {
     // intuitive kill switches: brake or reverse also drops the drive
-    if (ship.fuel <= 0 || keys['Space'] || keys['KeyS']) ship.warpDrive = false;
+    if (ship.fuel <= 0 || keys['KeyB'] || keys['KeyS']) ship.warpDrive = false;
     else {
       ship.vel.addScaledVector(_fwd, mode.accel * dt);
       ship.fuel = Math.max(0, ship.fuel - mode.fuelRate * dt);
@@ -1760,22 +1821,30 @@ function physicsStep(dt) {
         atmoBody = b;
       }
 
-      if (r < b.visRadius + 0.9) {
-        const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
-        const speed = relV.length();
-        if (b.type === 'star') { damage(200 * dt + 50); }
-        else if (speed <= SAFE_LANDING_V) {
-          ship.landedOn = b;
-          ship.warpDrive = false;
-          ship.landLocal.copy(ship.pos).sub(b.position)
-            .applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
-        } else {
-          damage((speed - SAFE_LANDING_V) * 1.6);
-          const n = _tmpV.copy(ship.pos).sub(b.position).normalize();
-          const vn = relV.dot(n);
-          relV.addScaledVector(n, -1.7 * vn);
-          ship.vel.copy(b.velocity).addScaledVector(relV, 0.55);
-          ship.pos.copy(b.position).addScaledVector(n, b.visRadius + 1.4);
+      // Terrain-accurate boundary: fly freely all the way down — the
+      // ship only interacts when it truly touches the visible ground
+      // (mountain peak, valley floor or ocean), never an invisible
+      // shell hovering above it. The cheap analytic height query only
+      // runs when the ship is already skimming the planet.
+      if (r < b.visRadius * 1.12 + 3) {
+        const surfR = b.surfaceRadius(ship.pos);
+        if (r < surfR + 0.9) {
+          const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
+          const speed = relV.length();
+          if (b.type === 'star') { damage(200 * dt + 50); }
+          else if (speed <= SAFE_LANDING_V) {
+            ship.landedOn = b;
+            ship.warpDrive = false;
+            ship.landLocal.copy(ship.pos).sub(b.position)
+              .applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
+          } else {
+            damage((speed - SAFE_LANDING_V) * 1.6);
+            const n = _tmpV.copy(ship.pos).sub(b.position).normalize();
+            const vn = relV.dot(n);
+            relV.addScaledVector(n, -1.7 * vn);
+            ship.vel.copy(b.velocity).addScaledVector(relV, 0.55);
+            ship.pos.copy(b.position).addScaledVector(n, surfR + 1.4);
+          }
         }
       }
     }
@@ -1787,8 +1856,8 @@ function physicsStep(dt) {
   _relV.copy(ship.vel).sub(_refVel);
   let relSpeed = _relV.length();
 
-  // ---- hard brake (SPACE): exponential decay toward local rest ----
-  if (keys['Space'] && ship.fuel > 0) {
+  // ---- hard brake (B): exponential decay toward local rest ----
+  if (keys['KeyB'] && ship.fuel > 0) {
     const k = 1 - Math.exp(-BRAKE_DAMP * dt);
     ship.vel.addScaledVector(_relV, -k);
     ship.fuel = Math.max(0, ship.fuel - 0.6 * dt);
@@ -1805,6 +1874,23 @@ function physicsStep(dt) {
     // Fades out above 30 u/s so gravity slingshots still work.
     const assist = THREE.MathUtils.clamp(1 - relSpeed / 30, 0, 1);
     if (assist > 0) ship.vel.addScaledVector(_gAcc, -assist * dt);
+    // …but the hover must NOT become a wall above the ground: when
+    // idling close to the terrain the assist servos a gentle 6 u/s
+    // descent instead, so the ship glides down and touches the real
+    // surface by itself (6 u/s ≪ SAFE_LANDING_V — always a soft landing)
+    const gbd = gravBody();
+    if (gbd && gbd.type !== 'star') {
+      _tmpV.copy(ship.pos).sub(gbd.position);
+      const dg = _tmpV.length();
+      if (dg < gbd.visRadius * 1.12 + 48) {
+        _tmpV.divideScalar(dg);                       // radial "up"
+        const alt = dg - gbd.surfaceRadius(ship.pos);
+        if (alt < 45) {
+          const vr = _tmpV2.copy(ship.vel).sub(_refVel).dot(_tmpV);
+          ship.vel.addScaledVector(_tmpV, (-6 - vr) * Math.min(1, 4 * dt));
+        }
+      }
+    }
   }
 
   // per-mode speed cap (soft clamp so gravity assists still add punch)
@@ -1918,10 +2004,20 @@ function updateCamera(dt) {
   });
   // LERP chase camera — smooth, judder-free follow
   _up.set(0, 1, 0).applyQuaternion(ship.quat);
-  camTarget.copy(ship.pos)
-    .add(_tmpV.set(0, 1.9, 7).applyQuaternion(ship.quat));
-  const k = 1 - Math.pow(0.0015, dt);
-  camPos.lerp(camTarget, k);          // camPos = persistent smoothed state
+  if (viewMode === 'cockpit') {
+    camTarget.copy(ship.pos)
+      .add(_tmpV.set(0, 0.32, -0.35).applyQuaternion(ship.quat));
+  } else {
+    camTarget.copy(ship.pos)
+      .add(_tmpV.set(0, 1.9, 7).applyQuaternion(ship.quat));
+  }
+  if (camSnap || keys['Space'] || viewMode === 'cockpit') {
+    camPos.copy(camTarget);          // instant snap — no smoothing lag
+    camSnap = false;
+  } else {
+    const k = 1 - Math.pow(0.0015, dt);
+    camPos.lerp(camTarget, k);       // camPos = persistent smoothed state
+  }
   camera.position.copy(camPos);       // shake is applied AFTER this copy,
   // so the offset only affects the DISPLAYED camera for this one frame
   // and can never leak into camPos, ship.pos or ship.vel (no drift).
@@ -1987,7 +2083,20 @@ function animate() {
   // leaving time-warp observation mode: velocities of the bodies are
   // sane again — re-anchor the ship to the local frame once, smoothly
   const observingNow = WARP_STEPS[warpIndex] > 1 && !ship.landedOn && !ship.dead;
-  if (wasObserving && !observingNow) syncToLocalFrame();
+  if (wasObserving && !observingNow) {
+    syncToLocalFrame();
+    // collisions were suspended during time warp — if a planet swept
+    // through the ship, restore a valid state just above its surface
+    const gb = gravBody();
+    if (gb) {
+      const d = ship.pos.distanceTo(gb.position);
+      const sR = gb.surfaceRadius(ship.pos);
+      if (d < sR + 1.2) {
+        _tmpV.copy(ship.pos).sub(gb.position).normalize();
+        ship.pos.copy(gb.position).addScaledVector(_tmpV, sR + 2.5);
+      }
+    }
+  }
   wasObserving = observingNow;
   if (ship.dead) { fx.burn *= Math.max(0, 1 - dt * 3); fx.turbo = 0; }
 
