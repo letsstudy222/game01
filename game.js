@@ -263,6 +263,8 @@ const starfield = buildStarfield();
 const fx = {
   burn: 0,            // re-entry intensity (set by physics)
   turbo: 0,           // turbo-thrust shake (set by physics)
+  relSpeed: 0,        // ship speed RELATIVE to the local frame — HUD/FX
+  relVel: new THREE.Vector3(),   //   must never use absolute velocity,
   atmoAmt: 0,         // 0..1 how deep inside an atmosphere
   atmoSm: 0,          // smoothed
   atmoColor: new THREE.Color(0x88aaff),
@@ -1123,7 +1125,7 @@ function buildSolarSystem() {
     craters: 90,
     palette: [{h:0,c:0x55534f},{h:0.5,c:0x7d7a74},{h:1,c:0xb0aca4}],
     iceCaps: 0, surfaceG: 1.62, spin: 0.005,
-    orbit: els(3.844e5, 0.00257, 0.0549, 5.1, 30, { moon: true, periodScale: 42 }),
+    orbit: els(3.844e5, 0.00257, 0.0549, 5.1, 30, { moon: true, periodScale: 1000 }),
     scan: { cls: 'Rocky moon (airless)', mass: '7.35×10²² kg', radius: '1,737 km',
             grav: '1.62 m/s²', temp: '−173 … +127 °C', press: '≈ 0',
             atmo: [['He/Ne/Ar', 100]] } });
@@ -1165,7 +1167,7 @@ function buildSolarSystem() {
         {h:0.6,c:((((lo>>16)+(hi>>16))>>1)<<16)|(((((lo>>8)&255)+((hi>>8)&255))>>1)<<8)|(((lo&255)+(hi&255))>>1)},
         {h:1,c:hi}],
       iceCaps: 0, surfaceG: 1.5, spin: 0.004,
-      orbit: els(dKm, 0.003 + k * 0.002, 0.005, 1 + k, 60 + k * 90, { moon: true, periodScale: 30 }),
+      orbit: els(dKm, 0.003 + k * 0.002, 0.005, 1 + k, 60 + k * 90, { moon: true, periodScale: 220 }),
       scan: { cls: 'Icy/volcanic moon', mass: '≈10²³ kg', radius: rKm.toLocaleString() + ' km',
               grav: '≈1.5 m/s²', temp: '−160 °C', press: '≈ 0',
               atmo: [['trace', 100]] } });
@@ -1189,7 +1191,7 @@ function buildSolarSystem() {
     craters: 6, ocean: { level: 0.0, color: 0x2e2a1a, shininess: 60 },
     palette: [{h:0,c:0x7a5a28},{h:0.6,c:0xa8823c},{h:1,c:0xd0ad5e}],
     iceCaps: 0, surfaceG: 1.35, spin: 0.003,
-    orbit: els(1.2219e6, 0.008, 0.028, 0.3, 10, { moon: true, periodScale: 22 }),
+    orbit: els(1.2219e6, 0.008, 0.028, 0.3, 10, { moon: true, periodScale: 190 }),
     clouds: { height: 1.06, colA: 0xd8a24e, colB: 0x8f6a2e,
               cover: 0.9, scale: 2.5, speed: 0.015 },
     atmosphere: { color: 0xd8a24e, scale: 1.2, power: 3.0, intensity: 1.4 },
@@ -1411,8 +1413,8 @@ const ship = {
    Releasing thrust engages linear damping: velocity eases back toward
    the local reference frame (nearest body if close, else rest).      */
 const MODES = {
-  NORMAL: { accel: 30,   max: 60,    damp: 1.4, fuelRate: 1.0 },
-  TURBO:  { accel: 380,  max: 1500,  damp: 0.9, fuelRate: 3.0 },
+  NORMAL: { accel: 30,   max: 60,    damp: 1.9, fuelRate: 1.0 },
+  TURBO:  { accel: 380,  max: 1500,  damp: 1.1, fuelRate: 3.0 },
   WARP:   { accel: 6000, max: 24000, damp: 0.0, fuelRate: 5.0 }
 };
 const ROT_SPEED = 1.6;
@@ -1435,6 +1437,17 @@ window.addEventListener('keydown', e => {
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 
+// If the window loses focus mid-keypress the 'keyup' never arrives and
+// the ship thrusts/spins forever. Clear ALL key state on focus loss.
+function clearKeys() {
+  for (const k in keys) keys[k] = false;
+  ship.throttle = 0;
+}
+window.addEventListener('blur', clearKeys);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) clearKeys();
+});
+
 function toggleWarpDrive() {
   if (ship.dead || ship.landedOn) return;
   if (!ship.warpDrive && ship.fuel < 5) { flashFlag('flag-warn', 1.2); return; }
@@ -1456,15 +1469,32 @@ let currentSystem = 0;
 function respawn() {
   const sys = systems[currentSystem];
   ship.pos.copy(sys.spawn());
-  ship.vel.set(0, 0, 0);
   ship.quat.identity();
   ship.fuel = 100; ship.hull = 100; ship.shield = 100;
   ship.landedOn = null; ship.dead = false; ship.warpDrive = false;
+  // CRITICAL: planets orbit at ~100+ u/s. Spawning with vel = 0 makes
+  // the planet visibly run away from the ship — the classic "auto
+  // drift on load" bug. Spawn co-moving with the nearest body instead.
+  syncToLocalFrame();
+  camPos.copy(ship.pos).add(_tmpV.set(0, 1.9, 7).applyQuaternion(ship.quat));
   document.getElementById('gameover').classList.add('hidden');
 }
-document.getElementById('respawn').addEventListener('click', () => {
+
+// Match the ship's velocity to the nearest body's orbital velocity.
+function syncToLocalFrame() {
+  const gb = gravBody();
+  if (gb && ship.pos.distanceTo(gb.position) < gb.visRadius * 60
+         && gb.velocity.length() < 5000) {
+    ship.vel.copy(gb.velocity);
+  } else {
+    ship.vel.set(0, 0, 0);
+  }
+}
+document.getElementById('respawn').addEventListener('click', (e) => {
+  e.currentTarget.blur();     // else SPACE (brake) would click it again
   currentSystem = 0;
   ui.system.textContent = systems[0].name;
+  clearKeys();
   respawn();
 });
 
@@ -1475,8 +1505,9 @@ function jumpNextSystem() {
   currentSystem = (currentSystem + 1) % systems.length;
   const sys = systems[currentSystem];
   ship.pos.copy(sys.spawn());
-  ship.vel.set(0, 0, 0);
   ship.landedOn = null; ship.warpDrive = false;
+  syncToLocalFrame();                       // co-move with the new planet
+  camPos.copy(ship.pos).add(_tmpV.set(0, 1.9, 7).applyQuaternion(ship.quat));
   ui.system.textContent = sys.name;
 }
 
@@ -1549,6 +1580,21 @@ function scanNearest() {
   });
 }
 
+// The body whose gravity DOMINATES at the ship (max μ/r²). Using raw
+// nearest-distance made a passing moon hijack the reference frame and
+// drag the ship along at its orbital speed — a major drift source.
+function gravBody() {
+  let best = null, bi = 0;
+  for (const b of bodies) {
+    if (b.systemIndex !== currentSystem || b.mu === 0) continue;
+    const r = Math.max(1, b.position.distanceTo(ship.pos));
+    if (r > b.visRadius * 120) continue;
+    const infl = b.mu / (r * r);
+    if (infl > bi) { bi = infl; best = b; }
+  }
+  return best;
+}
+
 function nearestBody() {
   let best = null, bd = Infinity;
   for (const b of bodies) {
@@ -1599,14 +1645,15 @@ function fmtDist(d) {
 const _tmpV = new THREE.Vector3();
 const _tmpV2 = new THREE.Vector3();
 const _refVel = new THREE.Vector3();
+const _gAcc = new THREE.Vector3();     // gravity accel this step (for flight assist)
 const _relV = new THREE.Vector3();
 const _fwd = new THREE.Vector3(0, 0, -1);
 const _up = new THREE.Vector3(0, 1, 0);
 
 function physicsStep(dt) {
-  if (ship.dead) return;
+  if (ship.dead || !(dt > 0)) return;      // guard: never integrate NaN/0
 
-  // ---- attitude ----
+  // ---- attitude (keyup handled globally; blur clears stuck keys) ----
   const rq = new THREE.Quaternion();
   if (keys['KeyA'])      { rq.setFromAxisAngle(new THREE.Vector3(0,1,0),  ROT_SPEED*dt); ship.quat.multiply(rq); }
   if (keys['KeyD'])      { rq.setFromAxisAngle(new THREE.Vector3(0,1,0), -ROT_SPEED*dt); ship.quat.multiply(rq); }
@@ -1626,6 +1673,7 @@ function physicsStep(dt) {
     ship.fuel = Math.min(100, ship.fuel + 6 * dt);
     ship.hull = Math.min(100, ship.hull + 2 * dt);
     ui.fLand.classList.remove('hidden');
+    fx.relSpeed = 0; fx.relVel.set(0, 0, 0); fx.burn = 0; fx.turbo = 0; fx.atmoAmt = 0;
     if (keys['KeyW'] && ship.fuel > 0.5) {
       ship.landedOn = null;
       _tmpV2.copy(ship.pos).sub(b.position).normalize();
@@ -1636,28 +1684,37 @@ function physicsStep(dt) {
   }
   ui.fLand.classList.add('hidden');
 
-  // ---- local reference frame: nearest body's velocity when close ----
-  const nb = nearestBody();
-  if (nb && ship.pos.distanceTo(nb.position) < nb.visRadius * 60) {
-    _refVel.copy(nb.velocity);
+  /* ---- OBSERVATION MODE ---------------------------------------------
+     At time-warp ×10…×1000 the finite-difference body velocities scale
+     with the warp (a planet "moves" 1000× faster per real second). If
+     the ship kept coupling to that frame it would be yanked away at
+     absurd speeds — the "uncontrollable auto-run" bug. So while the
+     time warp is engaged the ship simply coasts: gravity, drag,
+     collisions and frame-damping are suspended until warp returns ×1. */
+  const observing = WARP_STEPS[warpIndex] > 1;
+
+  // ---- local reference frame: the gravitationally dominant body ----
+  const nb = nearestBody();                 // for warp auto-drop / HUD
+  const gb = gravBody();                    // for the velocity frame
+  if (!observing && gb && ship.pos.distanceTo(gb.position) < gb.visRadius * 60) {
+    _refVel.copy(gb.velocity);
   } else {
     _refVel.set(0, 0, 0);
   }
 
-  // ---- thrust / warp / damping ----
+  // ---- thrust / warp drive ----
   const mode = currentMode();
   ship.throttle = 0;
   let thrusting = false;
 
   if (ship.warpDrive) {
-    if (ship.fuel <= 0) ship.warpDrive = false;
+    // intuitive kill switches: brake or reverse also drops the drive
+    if (ship.fuel <= 0 || keys['Space'] || keys['KeyS']) ship.warpDrive = false;
     else {
-      // warp drive thrusts forward continuously
       ship.vel.addScaledVector(_fwd, mode.accel * dt);
       ship.fuel = Math.max(0, ship.fuel - mode.fuelRate * dt);
       ship.throttle = 1;
       thrusting = true;
-      // auto-drop near any body — prevents warping into a planet
       if (nb && ship.pos.distanceTo(nb.position) < nb.visRadius * WARP_DROP_RADII) {
         ship.warpDrive = false;
       }
@@ -1677,71 +1734,86 @@ function physicsStep(dt) {
     }
   }
 
-  // relative velocity in the local frame
-  _relV.copy(ship.vel).sub(_refVel);
-  const relSpeed = _relV.length();
-
-  // hard brake (SPACE) — exponential decay toward local rest
-  if (keys['Space'] && ship.fuel > 0) {
-    const k = 1 - Math.exp(-BRAKE_DAMP * dt);
-    ship.vel.addScaledVector(_relV, -k);
-    ship.fuel = Math.max(0, ship.fuel - 0.6 * dt);
-    ship.throttle = Math.max(ship.throttle, 0.4);
-    _relV.copy(ship.vel).sub(_refVel);
-  }
-  // LINEAR DAMPING: release the throttle and the ship eases to a stop
-  else if (!thrusting && mode.damp > 0 && relSpeed > 0.01) {
-    const k = 1 - Math.exp(-mode.damp * dt);
-    ship.vel.addScaledVector(_relV, -k);
-    _relV.copy(ship.vel).sub(_refVel);
-  }
-
-  // per-mode speed cap (soft clamp so gravity assists still add punch)
-  const sp = _relV.length();
-  if (sp > mode.max) {
-    const k = Math.min(1, 3 * dt) * (1 - mode.max / sp);
-    ship.vel.addScaledVector(_relV, -k);
-  }
-
-  // ---- n-body gravity ----
+  /* ---- n-body gravity FIRST, damping AFTER -------------------------
+     v2 damped before gravity, so gravity re-injected velocity every
+     frame and an idle ship sank into the nearest planet forever —
+     "drifts by itself with no input". Correct order: apply gravity,
+     then let damping / flight-assist neutralise it while idle.       */
   let gPull = 0;
   let atmoBody = null, atmoDensity = 0;
-  for (const b of bodies) {
-    if (b.systemIndex !== currentSystem || b.mu === 0) continue;
-    _tmpV.copy(b.position).sub(ship.pos);
-    const r = _tmpV.length();
-    if (r > b.visRadius * 120) continue;
-    const a = b.mu / (r * r);
-    ship.vel.addScaledVector(_tmpV.normalize(), a * dt);
-    gPull += a;
+  _gAcc.set(0, 0, 0);
+  if (!observing) {
+    for (const b of bodies) {
+      if (b.systemIndex !== currentSystem || b.mu === 0) continue;
+      _tmpV.copy(b.position).sub(ship.pos);
+      const r = _tmpV.length();
+      if (r > b.visRadius * 120) continue;
+      const a = b.mu / (r * r);
+      _tmpV.normalize();
+      ship.vel.addScaledVector(_tmpV, a * dt);
+      _gAcc.addScaledVector(_tmpV, a);
+      gPull += a;
 
-    if (b.atmo && r < b.visRadius * b.atmo.height) {
-      const alt01 = (r - b.visRadius) / (b.visRadius * (b.atmo.height - 1));
-      atmoDensity = b.atmo.density * Math.exp(-Math.max(0, alt01) * 4);
-      atmoBody = b;
-    }
+      if (b.atmo && r < b.visRadius * b.atmo.height) {
+        const alt01 = (r - b.visRadius) / (b.visRadius * (b.atmo.height - 1));
+        atmoDensity = b.atmo.density * Math.exp(-Math.max(0, alt01) * 4);
+        atmoBody = b;
+      }
 
-    if (r < b.visRadius + 0.9) {
-      const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
-      const speed = relV.length();
-      if (b.type === 'star') { damage(200 * dt + 50); }
-      else if (speed <= SAFE_LANDING_V) {
-        ship.landedOn = b;
-        ship.warpDrive = false;
-        ship.landLocal.copy(ship.pos).sub(b.position)
-          .applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
-      } else {
-        damage((speed - SAFE_LANDING_V) * 1.6);
-        const n = _tmpV.copy(ship.pos).sub(b.position).normalize();
-        const vn = relV.dot(n);
-        relV.addScaledVector(n, -1.7 * vn);
-        ship.vel.copy(b.velocity).addScaledVector(relV, 0.55);
-        ship.pos.copy(b.position).addScaledVector(n, b.visRadius + 1.4);
+      if (r < b.visRadius + 0.9) {
+        const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
+        const speed = relV.length();
+        if (b.type === 'star') { damage(200 * dt + 50); }
+        else if (speed <= SAFE_LANDING_V) {
+          ship.landedOn = b;
+          ship.warpDrive = false;
+          ship.landLocal.copy(ship.pos).sub(b.position)
+            .applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
+        } else {
+          damage((speed - SAFE_LANDING_V) * 1.6);
+          const n = _tmpV.copy(ship.pos).sub(b.position).normalize();
+          const vn = relV.dot(n);
+          relV.addScaledVector(n, -1.7 * vn);
+          ship.vel.copy(b.velocity).addScaledVector(relV, 0.55);
+          ship.pos.copy(b.position).addScaledVector(n, b.visRadius + 1.4);
+        }
       }
     }
   }
   ui.grav.textContent = gPull.toFixed(2);
   if (gPull > 25) flashFlag('flag-warn', 0.3);
+
+  // relative velocity in the local frame
+  _relV.copy(ship.vel).sub(_refVel);
+  let relSpeed = _relV.length();
+
+  // ---- hard brake (SPACE): exponential decay toward local rest ----
+  if (keys['Space'] && ship.fuel > 0) {
+    const k = 1 - Math.exp(-BRAKE_DAMP * dt);
+    ship.vel.addScaledVector(_relV, -k);
+    ship.fuel = Math.max(0, ship.fuel - 0.6 * dt);
+    ship.throttle = Math.max(ship.throttle, 0.4);
+  }
+  // ---- LINEAR DAMPING + FLIGHT ASSIST while idle -------------------
+  else if (!thrusting && mode.damp > 0) {
+    if (relSpeed > 0.01) {
+      const k = 1 - Math.exp(-mode.damp * dt);
+      ship.vel.addScaledVector(_relV, -k);
+    }
+    // flight assist: at low relative speed the RCS silently counters
+    // gravity, so a parked ship HOVERS instead of endlessly falling.
+    // Fades out above 30 u/s so gravity slingshots still work.
+    const assist = THREE.MathUtils.clamp(1 - relSpeed / 30, 0, 1);
+    if (assist > 0) ship.vel.addScaledVector(_gAcc, -assist * dt);
+  }
+
+  // per-mode speed cap (soft clamp so gravity assists still add punch)
+  _relV.copy(ship.vel).sub(_refVel);
+  relSpeed = _relV.length();
+  if (relSpeed > mode.max) {
+    const k = Math.min(1, 3 * dt) * (1 - mode.max / relSpeed);
+    ship.vel.addScaledVector(_relV, -k);
+  }
 
   // ---- atmospheric drag + re-entry burn ----
   let burning = 0;
@@ -1763,9 +1835,11 @@ function physicsStep(dt) {
   ui.vignette.style.opacity = Math.min(0.9, burning).toFixed(2);
   shipVisual.burn.material.opacity = Math.min(0.65, burning);
 
-  // ---- feed the cinematic FX state ----
+  // ---- feed the cinematic FX state (RELATIVE frame only) ----
   fx.burn = burning;
   fx.turbo = (mode === MODES.TURBO && thrusting) ? 1 : 0;
+  fx.relVel.copy(ship.vel).sub(_refVel);
+  fx.relSpeed = fx.relVel.length();
   if (atmoBody) {
     fx.atmoColor.setHex(atmoBody.atmoColor);
     fx.atmoAmt = Math.min(1, atmoDensity / atmoBody.atmo.density);
@@ -1802,6 +1876,7 @@ function damage(amount) {
 let simTime = 0;
 let perfTime = 0;
 const camTarget = new THREE.Vector3();
+const _shakeOff = new THREE.Vector3();  // display-only shake offset
 const camPos = new THREE.Vector3();
 
 function updateBodies(dt) {
@@ -1846,21 +1921,25 @@ function updateCamera(dt) {
   camTarget.copy(ship.pos)
     .add(_tmpV.set(0, 1.9, 7).applyQuaternion(ship.quat));
   const k = 1 - Math.pow(0.0015, dt);
-  camPos.lerp(camTarget, k);
-  camera.position.copy(camPos);
-  // camera shake: turbo burns, warp drive and re-entry rattle the hull.
-  // Three detuned Math.sin oscillators ≈ chaotic-feeling vibration.
+  camPos.lerp(camTarget, k);          // camPos = persistent smoothed state
+  camera.position.copy(camPos);       // shake is applied AFTER this copy,
+  // so the offset only affects the DISPLAYED camera for this one frame
+  // and can never leak into camPos, ship.pos or ship.vel (no drift).
+  _shakeOff.set(0, 0, 0);
   const shakeAmp = fx.burn * 0.6 + fx.turbo * 0.10 + fx.warp * 0.20;
   if (shakeAmp > 0.001) {
     const t = perfTime;
-    camera.position.x += Math.sin(t * 37.1) * shakeAmp;
-    camera.position.y += Math.sin(t * 43.7 + 1.7) * shakeAmp * 0.8;
-    camera.position.z += Math.sin(t * 29.3 + 0.6) * shakeAmp * 0.5;
+    _shakeOff.set(
+      Math.sin(t * 37.1)       * shakeAmp,
+      Math.sin(t * 43.7 + 1.7) * shakeAmp * 0.8,
+      Math.sin(t * 29.3 + 0.6) * shakeAmp * 0.5);
+    camera.position.add(_shakeOff);
   }
   camera.up.copy(_up);
   camera.lookAt(_tmpV.copy(ship.pos).addScaledVector(_fwd, 30));
   // FOV stretch: warp drive pulls the view wide for a smooth hyperspace feel
-  const speedKick = Math.min(10, ship.vel.length() * 0.006);
+  // (relative speed — parked beside an orbiting planet must read as 0)
+  const speedKick = Math.min(10, fx.relSpeed * 0.006);
   const targetFov = ship.warpDrive ? 96 : 62 + speedKick;
   camera.fov += (targetFov - camera.fov) * Math.min(1, dt * 2.5);
   camera.updateProjectionMatrix();
@@ -1871,10 +1950,11 @@ function updateHUD() {
   ui.fuelF.style.width = ship.fuel + '%';  ui.fuelV.textContent = Math.round(ship.fuel) + '%';
   ui.hullF.style.width = ship.hull + '%';  ui.hullV.textContent = Math.round(ship.hull) + '%';
   ui.shF.style.width = ship.shield + '%';  ui.shV.textContent = Math.round(ship.shield) + '%';
-  ui.vel.textContent = ship.vel.length().toFixed(1);
+  ui.vel.textContent = fx.relSpeed.toFixed(1);
   ui.thr.textContent = Math.round(ship.throttle * 100) + '%';
   ui.mode.textContent = currentModeName();
   ui.mode.style.color = ship.warpDrive ? 'var(--amber)' : '';
+  ui.warp.style.color = (WARP_STEPS[warpIndex] > 1) ? 'var(--red)' : 'var(--amber)';
   const nb = nearestBody();
   if (nb) {
     ui.nearName.textContent = nb.name;
@@ -1889,6 +1969,7 @@ function updateHUD() {
 }
 
 let frameCount = 0;
+let wasObserving = false;
 function animate() {
   requestAnimationFrame(animate);
   // THREE.Clock delta — ship speed identical on 30, 60 or 144 FPS rigs
@@ -1903,6 +1984,13 @@ function animate() {
   frameCount++;
   if (frameCount % 3 === 0) { updateHUD(); updateLabels(); }
 
+  // leaving time-warp observation mode: velocities of the bodies are
+  // sane again — re-anchor the ship to the local frame once, smoothly
+  const observingNow = WARP_STEPS[warpIndex] > 1 && !ship.landedOn && !ship.dead;
+  if (wasObserving && !observingNow) syncToLocalFrame();
+  wasObserving = observingNow;
+  if (ship.dead) { fx.burn *= Math.max(0, 1 - dt * 3); fx.turbo = 0; }
+
   // ---- cinematic FX updates ----
   fx.warp += ((ship.warpDrive ? 1 : 0) - fx.warp) * Math.min(1, dt * 2.2);
   fx.atmoSm += (fx.atmoAmt - fx.atmoSm) * Math.min(1, dt * 3);
@@ -1911,12 +1999,12 @@ function animate() {
     nebula.material.uniforms.uTime.value = perfTime;
   }
   if (dust) {
-    const sp = ship.vel.length();
+    const sp = fx.relSpeed;                 // relative — no false motion
     const u = dust.material.uniforms;
     u.uCenter.value.copy(camera.position);
-    u.uVel.value.copy(ship.vel);
+    u.uVel.value.copy(fx.relVel);
     u.uStretch.value = 0.03 + sp * 0.0012 + fx.warp * 0.55;   // warp streaks
-    u.uAlpha.value = THREE.MathUtils.clamp(sp / 60, 0.08, 0.8) + fx.warp * 0.2;
+    u.uAlpha.value = THREE.MathUtils.clamp(sp / 60, 0.05, 0.8) + fx.warp * 0.2;
   }
   if (composer) {
     warpPass.uniforms.uAmount.value = fx.warp;
