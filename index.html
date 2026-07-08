@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HELIOS // Procedural Universe Simulator</title>
+<link rel="stylesheet" href="style.css">
+<!-- Three.js via CDN — no bundler, no backend. GitHub Pages ready. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+
+<!-- ======================= LOADING SCREEN ======================= -->
+<div id="loader">
+  <div class="loader-inner">
+    <div class="loader-title">HELIOS<span> // UNIVERSE SIMULATOR</span></div>
+    <div class="loader-bar"><div id="loader-fill"></div></div>
+    <div id="loader-status">Generating celestial bodies…</div>
+  </div>
+</div>
+
+<!-- ======================= 3D CANVAS ======================= -->
+<canvas id="space"></canvas>
+
+<!-- ======================= HUD OVERLAY ======================= -->
+<div id="hud" class="hidden">
+
+  <!-- Corner frame (signature bracket décor) -->
+  <div class="frame tl"></div><div class="frame tr"></div>
+  <div class="frame bl"></div><div class="frame br"></div>
+
+  <!-- TOP BAR : ship status -->
+  <header id="topbar">
+    <div class="stat">
+      <label>FUEL</label>
+      <div class="bar"><div id="fuel-fill" class="fill fuel"></div></div>
+      <span id="fuel-val">100%</span>
+    </div>
+    <div class="stat">
+      <label>HULL</label>
+      <div class="bar"><div id="hull-fill" class="fill hull"></div></div>
+      <span id="hull-val">100%</span>
+    </div>
+    <div class="stat">
+      <label>SHIELD</label>
+      <div class="bar"><div id="shield-fill" class="fill shield"></div></div>
+      <span id="shield-val">100%</span>
+    </div>
+    <div class="stat wide">
+      <label>SYSTEM</label>
+      <span id="system-name" class="mono">SOL</span>
+    </div>
+    <div class="stat">
+      <label>TIME WARP</label>
+      <span id="warp-val" class="mono">×1</span>
+    </div>
+  </header>
+
+  <!-- LEFT : navigation readouts -->
+  <aside id="navpanel">
+    <div class="row"><label>VEL</label><span id="vel-val" class="mono">0.0</span><em>u/s</em></div>
+    <div class="row"><label>THR</label><span id="thr-val" class="mono">0%</span></div>
+    <div class="row"><label>G-PULL</label><span id="grav-val" class="mono">0.00</span></div>
+    <div class="row"><label>NEAREST</label><span id="near-name" class="mono">—</span></div>
+    <div class="row"><label>DIST</label><span id="near-dist" class="mono">—</span></div>
+    <div class="row"><label>ALT</label><span id="alt-val" class="mono">—</span></div>
+    <div id="flight-flags">
+      <span id="flag-atmo" class="flag hidden">ATMOSPHERE</span>
+      <span id="flag-reentry" class="flag hot hidden">RE-ENTRY BURN</span>
+      <span id="flag-landed" class="flag ok hidden">LANDED — REFUELING</span>
+      <span id="flag-warn" class="flag hot hidden">GRAVITY WELL</span>
+    </div>
+  </aside>
+
+  <!-- RIGHT : planetary scanner -->
+  <aside id="scanner" class="hidden">
+    <div class="scan-head">
+      <span class="scan-title">PLANETARY SCAN</span>
+      <span id="scan-name" class="mono">—</span>
+    </div>
+    <table class="scan-table">
+      <tr><td>Class</td><td id="scan-class" class="mono">—</td></tr>
+      <tr><td>Mass</td><td id="scan-mass" class="mono">—</td></tr>
+      <tr><td>Radius</td><td id="scan-radius" class="mono">—</td></tr>
+      <tr><td>Gravity (g)</td><td id="scan-grav" class="mono">—</td></tr>
+      <tr><td>Surface temp</td><td id="scan-temp" class="mono">—</td></tr>
+      <tr><td>Pressure</td><td id="scan-press" class="mono">—</td></tr>
+    </table>
+    <div class="scan-sub">ATMOSPHERIC COMPOSITION</div>
+    <div id="scan-atmo" class="atmo-list"></div>
+  </aside>
+
+  <!-- CENTER : crosshair -->
+  <div id="crosshair"><div class="ch-ring"></div><div class="ch-dot"></div></div>
+
+  <!-- BOTTOM : controls hint -->
+  <footer id="controls">
+    <span><b>W/S</b> thrust</span><span><b>A/D</b> yaw</span>
+    <span><b>↑/↓</b> pitch</span><span><b>Q/E</b> roll</span>
+    <span><b>SPACE</b> afterburner</span><span><b>SHIFT</b> retro-brake</span>
+    <span><b>T</b> scan</span><span><b>1–5</b> time warp</span>
+    <span><b>N</b> next system</span><span><b>H</b> hide help</span>
+  </footer>
+
+  <!-- Body labels container (projected from 3D) -->
+  <div id="labels"></div>
+
+  <!-- Re-entry vignette -->
+  <div id="burn-vignette"></div>
+</div>
+
+<!-- Death / respawn -->
+<div id="gameover" class="hidden">
+  <div class="go-box">
+    <div class="go-title">HULL INTEGRITY LOST</div>
+    <p>Your ship broke apart. Telemetry saved to the void.</p>
+    <button id="respawn">Respawn near Earth</button>
+  </div>
+</div>
+
+<script src="game.js"></script>
+</body>
+</html>
