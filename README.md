@@ -24,12 +24,28 @@ No build step, no server required.
 | `A` / `D` | Yaw left / right |
 | `↑` / `↓` | Pitch |
 | `Q` / `E` | Roll |
-| `SPACE` | Afterburner (×9 thrust, heavy fuel burn) |
-| `SHIFT` | Retro-thrusters (burn against velocity vector) |
+| `SHIFT` | Turbo mode (cruise between moons) |
+| `F` / `J` | Warp Drive toggle (hyper-cruise between planets, FOV stretch + star-streaks) |
+| `SPACE` | Hard brake |
 | `T` | Scan nearest celestial body |
 | `1`–`5` | Time warp ×1 / ×10 / ×50 / ×200 / ×1000 |
 | `N` | Hyperjump to next star system (costs 20% fuel) |
 | `H` | Toggle controls help |
+
+## v3 — No Man's Sky-style visuals
+- **Cinematic post-processing** — EffectComposer pipeline: UnrealBloomPass
+  (glowing suns, engines, Venus lava, Saturn's ice rings), a radial
+  motion-blur warp-streak pass, and a final ACES-filmic tonemap +
+  teal/orange colour-grade + vignette + cockpit hologram pass.
+- **Procedural nebulae** — 2,600 soft noise-shaded points in six coloured
+  clusters (violet/teal/magenta/amber) shimmering slowly behind the stars.
+- **Space dust streaks** — 900 wrap-around line particles stream past the
+  hull to sell velocity, and stretch into hyperspace streaks during warp.
+- **Distance-adaptive micro-detail** — rocky surfaces gain high-frequency
+  noise and crack lines as you close in (injected into the PBR shader).
+- **Camera shake** — sin-oscillator rattle during turbo, warp and re-entry.
+- Post-processing scripts load from jsDelivr; if unavailable the game
+  falls back to plain rendering automatically.
 
 ## What's inside
 - **Kepler orbital mechanics** — real orbital elements (a, e, i) for all 8 planets

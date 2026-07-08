@@ -204,6 +204,8 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) composer.setSize(window.innerWidth, window.innerHeight);
+  if (gradePass) gradePass.uniforms.uRes.value.set(window.innerWidth, window.innerHeight);
 });
 
 /* =====================================================================
@@ -248,6 +250,276 @@ function buildStarfield() {
   return stars;
 }
 const starfield = buildStarfield();
+
+/* =====================================================================
+   2b. CINEMATIC FX — nebula, space dust, post-processing pipeline
+   ---------------------------------------------------------------------
+   RenderPass → UnrealBloomPass → WarpStreakPass (radial motion blur)
+   → GradePass (ACES filmic tonemap + NMS-style teal/orange grade +
+     atmosphere immersion tint + vignette + cockpit hologram overlay).
+   If the post-processing CDN scripts failed to load, everything
+   gracefully falls back to a plain renderer.render().
+   ===================================================================== */
+const fx = {
+  burn: 0,            // re-entry intensity (set by physics)
+  turbo: 0,           // turbo-thrust shake (set by physics)
+  atmoAmt: 0,         // 0..1 how deep inside an atmosphere
+  atmoSm: 0,          // smoothed
+  atmoColor: new THREE.Color(0x88aaff),
+  warp: 0             // smoothed warp-drive ramp 0..1
+};
+
+let composer = null, bloomPass = null, warpPass = null, gradePass = null;
+let nebula = null, dust = null;
+
+// ---- Procedural multi-colour nebula: THREE.Points + soft noise shader
+function buildNebula() {
+  const rand = mulberry32(31337);
+  const palette = [0x7b4dff, 0x19d9c4, 0xff4da6, 0xff9a3c, 0x3c7bff, 0x9dff6a];
+  const clusters = [];
+  for (let c = 0; c < 6; c++) {
+    const u = rand() * 2 - 1, th = rand() * Math.PI * 2, s = Math.sqrt(1 - u * u);
+    clusters.push({
+      dir: new THREE.Vector3(s * Math.cos(th), u, s * Math.sin(th)),
+      col: new THREE.Color(palette[c]),
+      spread: 0.22 + rand() * 0.3
+    });
+  }
+  const N = 2600, R = 50000;
+  const pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+  const size = new Float32Array(N), seed = new Float32Array(N), alp = new Float32Array(N);
+  const v = new THREE.Vector3(), cc = new THREE.Color();
+  for (let i = 0; i < N; i++) {
+    const cl = clusters[Math.floor(rand() * clusters.length)];
+    v.copy(cl.dir);
+    v.x += (rand() + rand() + rand() - 1.5) * cl.spread;
+    v.y += (rand() + rand() + rand() - 1.5) * cl.spread;
+    v.z += (rand() + rand() + rand() - 1.5) * cl.spread;
+    v.normalize().multiplyScalar(R);
+    pos[i*3] = v.x; pos[i*3+1] = v.y; pos[i*3+2] = v.z;
+    cc.copy(cl.col).lerp(new THREE.Color(0xffffff), rand() * 0.25)
+      .multiplyScalar(0.5 + rand() * 0.5);
+    col[i*3] = cc.r; col[i*3+1] = cc.g; col[i*3+2] = cc.b;
+    size[i] = 40 + rand() * 80;        // px — stays under GPU point-size caps
+    seed[i] = rand() * 100;
+    alp[i] = 0.3 + rand() * 0.7;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aColor', new THREE.BufferAttribute(col, 3));
+  geo.setAttribute('aSize', new THREE.BufferAttribute(size, 1));
+  geo.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+  geo.setAttribute('aAlpha', new THREE.BufferAttribute(alp, 1));
+  const mat = new THREE.ShaderMaterial({
+    vertexShader: `
+attribute vec3 aColor;
+attribute float aSize;
+attribute float aSeed;
+attribute float aAlpha;
+varying vec3 vColor;
+varying float vSeed;
+varying float vAlpha;
+void main(){
+  vColor = aColor; vSeed = aSeed; vAlpha = aAlpha;
+  gl_PointSize = aSize;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`,
+    fragmentShader: GLSL_NOISE + `
+uniform float uTime;
+varying vec3 vColor;
+varying float vSeed;
+varying float vAlpha;
+void main(){
+  vec2 p = gl_PointCoord - 0.5;
+  float d = length(p);
+  float soft = smoothstep(0.5, 0.05, d);
+  // drifting 3D noise makes each puff shimmer slowly (ethereal motion)
+  float n = fbm(vec3(p * 3.5, vSeed + uTime * 0.03), 3) * 0.5 + 0.5;
+  float a = soft * soft * n * vAlpha * 0.30;
+  gl_FragColor = vec4(vColor * (0.55 + 0.9 * n), a);
+}`,
+    uniforms: { uTime: { value: 0 } },
+    transparent: true, depthWrite: false, depthTest: false,
+    blending: THREE.AdditiveBlending
+  });
+  nebula = new THREE.Points(geo, mat);
+  nebula.renderOrder = -1;           // paint behind stars & everything else
+  nebula.frustumCulled = false;
+  scene.add(nebula);
+}
+
+// ---- Space dust: line segments around the ship. Streams past the hull
+//      to sell velocity; the tail vertex is stretched along −velocity so
+//      the same particles become hyperspace star-streaks during warp.
+const DUST_BOX = 320;
+function buildDust() {
+  const N = 900;
+  const pos = new Float32Array(N * 2 * 3);
+  const end = new Float32Array(N * 2);
+  const rand = mulberry32(9099);
+  for (let i = 0; i < N; i++) {
+    const x = rand() * DUST_BOX, y = rand() * DUST_BOX, z = rand() * DUST_BOX;
+    pos[i*6] = x;   pos[i*6+1] = y;   pos[i*6+2] = z;
+    pos[i*6+3] = x; pos[i*6+4] = y;   pos[i*6+5] = z;
+    end[i*2] = 0;   end[i*2+1] = 1;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('aEnd', new THREE.BufferAttribute(end, 1));
+  const mat = new THREE.ShaderMaterial({
+    vertexShader: `
+#include <common>
+#include <logdepthbuf_pars_vertex>
+attribute float aEnd;
+uniform vec3 uCenter;
+uniform vec3 uVel;
+uniform float uStretch;
+uniform float uBox;
+varying float vEnd;
+void main(){
+  vEnd = aEnd;
+  // infinite wrap: particles always fill a box around the camera
+  vec3 rel = mod(position - uCenter, vec3(uBox)) - 0.5 * uBox;
+  vec3 world = uCenter + rel - uVel * uStretch * aEnd;
+  gl_Position = projectionMatrix * viewMatrix * vec4(world, 1.0);
+  #include <logdepthbuf_vertex>
+}`,
+    fragmentShader: `
+#include <common>
+#include <logdepthbuf_pars_fragment>
+uniform float uAlpha;
+varying float vEnd;
+void main(){
+  gl_FragColor = vec4(0.72, 0.86, 1.0, (1.0 - vEnd * 0.85) * uAlpha);
+  #include <logdepthbuf_fragment>
+}`,
+    uniforms: {
+      uCenter: { value: new THREE.Vector3() },
+      uVel:    { value: new THREE.Vector3() },
+      uStretch:{ value: 0.05 },
+      uBox:    { value: DUST_BOX },
+      uAlpha:  { value: 0.3 }
+    },
+    transparent: true, depthWrite: false,
+    blending: THREE.AdditiveBlending
+  });
+  dust = new THREE.LineSegments(geo, mat);
+  dust.frustumCulled = false;
+  scene.add(dust);
+}
+
+// ---- Custom post passes -------------------------------------------
+const POST_VERT = `
+varying vec2 vUv;
+void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`;
+
+// Radial motion blur toward screen centre — hyperspace star-streaks
+const WarpStreakShader = {
+  uniforms: { tDiffuse: { value: null }, uAmount: { value: 0 } },
+  vertexShader: POST_VERT,
+  fragmentShader: `
+uniform sampler2D tDiffuse;
+uniform float uAmount;
+varying vec2 vUv;
+void main(){
+  vec4 base = texture2D(tDiffuse, vUv);
+  if (uAmount < 0.01) { gl_FragColor = base; return; }
+  vec2 dir = vUv - 0.5;
+  vec4 acc = vec4(0.0);
+  for (int i = 0; i < 10; i++) {
+    float t = float(i) / 10.0;
+    acc += texture2D(tDiffuse, vUv - dir * uAmount * 0.14 * t);
+  }
+  acc /= 10.0;
+  gl_FragColor = mix(base, acc * 1.1, smoothstep(0.0, 0.35, uAmount));
+}`
+};
+
+// ACES filmic tonemap + colour grade + vignette + cockpit hologram
+const GradeShader = {
+  uniforms: {
+    tDiffuse:  { value: null },
+    uTime:     { value: 0 },
+    uWarp:     { value: 0 },
+    uAtmo:     { value: 0 },
+    uAtmoColor:{ value: new THREE.Color(0x88aaff) },
+    uExposure: { value: 1.18 },
+    uRes:      { value: new THREE.Vector2(1920, 1080) }
+  },
+  vertexShader: POST_VERT,
+  fragmentShader: `
+uniform sampler2D tDiffuse;
+uniform float uTime;
+uniform float uWarp;
+uniform float uAtmo;
+uniform vec3 uAtmoColor;
+uniform float uExposure;
+uniform vec2 uRes;
+varying vec2 vUv;
+// ACES filmic curve (Narkowicz fit) — the ACESFilmicToneMapping look,
+// applied here so custom shaders & post FX are graded identically.
+vec3 ACESFilm(vec3 x){
+  return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14), 0.0, 1.0);
+}
+void main(){
+  vec2 uv = vUv;
+  vec2 c = uv - 0.5;
+  float r2 = dot(c, c);
+  // chromatic aberration, stronger during warp
+  float ca = 0.0012 + uWarp * 0.005;
+  vec3 col;
+  col.r = texture2D(tDiffuse, uv + c * ca).r;
+  col.g = texture2D(tDiffuse, uv).g;
+  col.b = texture2D(tDiffuse, uv - c * ca).b;
+  // atmosphere immersion: screen melts smoothly into the sky colour
+  col = mix(col, uAtmoColor * (0.35 + 0.75 * dot(col, vec3(0.333))), uAtmo * 0.5);
+  // tonemap + NMS-style grade: teal shadows, warm highlights, punchy sat
+  col = ACESFilm(col * uExposure);
+  float l = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(l), col, 1.22);
+  col += vec3(0.000, 0.026, 0.055) * (1.0 - l);
+  col += vec3(0.060, 0.024, -0.015) * l * l;
+  // vignette
+  col *= 1.0 - r2 * 0.5;
+  // ---- cockpit hologram overlay (edges only) ----
+  float edge = smoothstep(0.14, 0.5, r2);
+  vec2 g = uv * uRes / 36.0;
+  vec2 gf = abs(fract(g) - 0.5);
+  float grid = step(0.47, gf.x) + step(0.47, gf.y);
+  float sw = fract(uTime * 0.06);
+  float sweep = exp(-pow((uv.y - sw) * 55.0, 2.0));
+  float scan = sin(uv.y * uRes.y * 1.35) * 0.5 + 0.5;
+  vec3 holo = vec3(0.43, 0.90, 1.0);
+  col += holo * grid * 0.030 * edge;
+  col += holo * sweep * 0.045 * edge;
+  col *= 1.0 - scan * 0.03;
+  gl_FragColor = vec4(col, 1.0);
+}`
+};
+
+function initPost() {
+  const ok = THREE.EffectComposer && THREE.RenderPass &&
+             THREE.ShaderPass && THREE.UnrealBloomPass;
+  if (!ok) {                          // CDN blocked → graceful fallback
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.15;
+    return;
+  }
+  composer = new THREE.EffectComposer(renderer);
+  composer.addPass(new THREE.RenderPass(scene, camera));
+  bloomPass = new THREE.UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    0.85,   // strength — suns, engines, lava, ring ice all glow
+    0.45,   // radius
+    0.80);  // threshold
+  composer.addPass(bloomPass);
+  warpPass = new THREE.ShaderPass(WarpStreakShader);
+  composer.addPass(warpPass);
+  gradePass = new THREE.ShaderPass(GradeShader);
+  gradePass.uniforms.uRes.value.set(window.innerWidth, window.innerHeight);
+  composer.addPass(gradePass);
+}
+
 
 function makeGlowTexture(inner, outer) {
   const c = document.createElement('canvas');
@@ -294,7 +566,11 @@ void main(){
   float rim = pow(clamp(dot(viewDir, vNormal) + 1.05, 0.0, 1.05), uPower);
   float day = clamp(dot(-vNormal, sunDir) * 0.6 + 0.5, 0.05, 1.0);
   float mie = pow(max(dot(-viewDir, sunDir), 0.0), 24.0) * 0.9;
-  vec3 col = uColor * rim * day * uIntensity + vec3(1.0, 0.9, 0.75) * mie * rim;
+  // stylized volumetric rim: the limb burns toward white so the bloom
+  // pass picks it up and the planet edge glows like a neon halo
+  vec3 rimCol = mix(uColor, vec3(1.0), pow(rim, 3.0) * 0.4);
+  vec3 col = rimCol * rim * day * uIntensity * 1.35
+           + vec3(1.0, 0.9, 0.75) * mie * rim;
   gl_FragColor = vec4(col, clamp(rim * day, 0.0, 1.0));
   #include <logdepthbuf_fragment>
 }`;
@@ -586,6 +862,7 @@ function buildRockyMesh(cfg) {
   }
 
   const colors = new Float32Array(pos.count * 3);
+  const glowAttr = new Float32Array(pos.count);   // 0 everywhere but lava
   const v = new THREE.Vector3();
   const cTmp = new THREE.Color();
   const amp = cfg.amp * r;
@@ -608,6 +885,9 @@ function buildRockyMesh(cfg) {
     }
     let hw = h * amp;
     const hNorm = h;
+    // emissive lava mask — feeds the bloom pass on Venus basins
+    if (cfg.lava && hNorm < -0.22)
+      glowAttr[idx] = THREE.MathUtils.clamp((-0.22 - hNorm) * 4, 0, 1);
     // land below sea level is tucked just under the ocean sphere
     if (seaLevel !== null && hw < seaLevel * amp) hw = seaLevel * amp - 0.05;
     v.multiplyScalar(r + hw);
@@ -631,10 +911,43 @@ function buildRockyMesh(cfg) {
     colors[idx*3] = cTmp.r; colors[idx*3+1] = cTmp.g; colors[idx*3+2] = cTmp.b;
   }
   geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  geo.setAttribute('aGlow', new THREE.BufferAttribute(glowAttr, 1));
   geo.computeVertexNormals();
-  const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({
+  // Standard PBR material, extended via onBeforeCompile with:
+  //  • distance-adaptive micro-detail: as the ship closes in, high-
+  //    frequency noise + crack lines fade in so the surface never
+  //    turns into a blurry lo-poly ball at close range
+  //  • per-vertex emissive lava (aGlow) that feeds the bloom pass
+  const mat = new THREE.MeshStandardMaterial({
     vertexColors: true, roughness: 0.95, metalness: 0.02
-  }));
+  });
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uPlanetR = { value: r };
+    shader.uniforms.uDetailFreq = { value: 26 / r };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>',
+        '#include <common>\nattribute float aGlow;\nvarying float vGlow;\nvarying vec3 vObjPos;')
+      .replace('#include <begin_vertex>',
+        '#include <begin_vertex>\nvGlow = aGlow;\nvObjPos = position;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>',
+        '#include <common>\nvarying float vGlow;\nvarying vec3 vObjPos;\nuniform float uPlanetR;\nuniform float uDetailFreq;\n' + GLSL_NOISE)
+      .replace('#include <color_fragment>',
+        `#include <color_fragment>
+{
+  float camD = length(vViewPosition);
+  float fade = 1.0 - smoothstep(uPlanetR * 0.12, uPlanetR * 2.0, camD);
+  if (fade > 0.003) {
+    float micro  = fbm(vObjPos * uDetailFreq * 10.0, 4);
+    float cracks = 1.0 - smoothstep(0.015, 0.05,
+                     abs(snoise(vObjPos * uDetailFreq * 27.0)));
+    diffuseColor.rgb *= 1.0 + micro * 0.28 * fade - cracks * 0.22 * fade;
+  }
+}`)
+      .replace('#include <emissivemap_fragment>',
+        '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vec3(1.0, 0.32, 0.07) * vGlow * vGlow * 2.6;');
+  };
+  const mesh = new THREE.Mesh(geo, mat);
   // Specular ocean: smooth Phong sphere at sea level — the sun glints
   // off it (Earth's "specular map" effect) while land stays matte.
   if (cfg.ocean) {
@@ -723,6 +1036,8 @@ function addBody(cfg) {
     mu: (cfg.surfaceG || 0) * cfg.visRadius * cfg.visRadius * G_GAME,
     surfaceG: cfg.surfaceG || 0,
     atmo: cfg.atmoPhys || null,
+    atmoColor: cfg.atmosphere ? cfg.atmosphere.color
+             : (cfg.clouds ? cfg.clouds.colA : 0x88aaff),
     scan: cfg.scan || null,
     systemIndex: cfg.systemIndex,
     position: new THREE.Vector3(),
@@ -1448,6 +1763,16 @@ function physicsStep(dt) {
   ui.vignette.style.opacity = Math.min(0.9, burning).toFixed(2);
   shipVisual.burn.material.opacity = Math.min(0.65, burning);
 
+  // ---- feed the cinematic FX state ----
+  fx.burn = burning;
+  fx.turbo = (mode === MODES.TURBO && thrusting) ? 1 : 0;
+  if (atmoBody) {
+    fx.atmoColor.setHex(atmoBody.atmoColor);
+    fx.atmoAmt = Math.min(1, atmoDensity / atmoBody.atmo.density);
+  } else {
+    fx.atmoAmt = 0;
+  }
+
   // ---- shields recharge after 5 s without damage ----
   if (perfTime - ship.lastHitT > 5) {
     ship.shield = Math.min(100, ship.shield + 1.6 * dt);
@@ -1523,6 +1848,15 @@ function updateCamera(dt) {
   const k = 1 - Math.pow(0.0015, dt);
   camPos.lerp(camTarget, k);
   camera.position.copy(camPos);
+  // camera shake: turbo burns, warp drive and re-entry rattle the hull.
+  // Three detuned Math.sin oscillators ≈ chaotic-feeling vibration.
+  const shakeAmp = fx.burn * 0.6 + fx.turbo * 0.10 + fx.warp * 0.20;
+  if (shakeAmp > 0.001) {
+    const t = perfTime;
+    camera.position.x += Math.sin(t * 37.1) * shakeAmp;
+    camera.position.y += Math.sin(t * 43.7 + 1.7) * shakeAmp * 0.8;
+    camera.position.z += Math.sin(t * 29.3 + 0.6) * shakeAmp * 0.5;
+  }
   camera.up.copy(_up);
   camera.lookAt(_tmpV.copy(ship.pos).addScaledVector(_fwd, 30));
   // FOV stretch: warp drive pulls the view wide for a smooth hyperspace feel
@@ -1569,7 +1903,31 @@ function animate() {
   frameCount++;
   if (frameCount % 3 === 0) { updateHUD(); updateLabels(); }
 
-  renderer.render(scene, camera);
+  // ---- cinematic FX updates ----
+  fx.warp += ((ship.warpDrive ? 1 : 0) - fx.warp) * Math.min(1, dt * 2.2);
+  fx.atmoSm += (fx.atmoAmt - fx.atmoSm) * Math.min(1, dt * 3);
+  if (nebula) {
+    nebula.position.copy(camera.position);
+    nebula.material.uniforms.uTime.value = perfTime;
+  }
+  if (dust) {
+    const sp = ship.vel.length();
+    const u = dust.material.uniforms;
+    u.uCenter.value.copy(camera.position);
+    u.uVel.value.copy(ship.vel);
+    u.uStretch.value = 0.03 + sp * 0.0012 + fx.warp * 0.55;   // warp streaks
+    u.uAlpha.value = THREE.MathUtils.clamp(sp / 60, 0.08, 0.8) + fx.warp * 0.2;
+  }
+  if (composer) {
+    warpPass.uniforms.uAmount.value = fx.warp;
+    gradePass.uniforms.uTime.value = perfTime;
+    gradePass.uniforms.uWarp.value = fx.warp;
+    gradePass.uniforms.uAtmo.value = fx.atmoSm;
+    gradePass.uniforms.uAtmoColor.value.copy(fx.atmoColor);
+    composer.render();
+  } else {
+    renderer.render(scene, camera);
+  }
 }
 
 /* =====================================================================
@@ -1582,6 +1940,7 @@ const buildSteps = [
   ['Seeding star system Alpha…', () => buildProceduralSystem(1337, new THREE.Vector3( 900000, 40000, -350000))],
   ['Seeding star system Beta…',  () => buildProceduralSystem(4242, new THREE.Vector3(-750000, -60000, 600000))],
   ['Seeding star system Gamma…', () => buildProceduralSystem(9001, new THREE.Vector3( 200000, 120000, 950000))],
+  ['Igniting nebulae…', () => { buildNebula(); buildDust(); initPost(); }],
   ['Calibrating orbits…', () => { updateBodies(0); updateBodies(0.0001); }],
   ['Launching…', () => {
     respawn();
