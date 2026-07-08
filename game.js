@@ -980,6 +980,312 @@ function buildRockyMesh(cfg) {
   return mesh;
 }
 
+
+/* =====================================================================
+   5b. TERRA — flagship realistic planet (Earth)
+   ---------------------------------------------------------------------
+   • Spherified-cube grid (6 warped cube faces): even triangle density,
+     zero polar pinching — the classic UV-sphere artifact is gone.
+   • Displacement runs in the VERTEX SHADER (GPU): layered fBm (6 oct)
+     + ridged multifractal mountains + billow plains, with per-vertex
+     normals rebuilt from the height-field gradient for true relief
+     lighting under MeshStandardMaterial.
+   • Biome colouring by HEIGHT and SLOPE in the fragment shader:
+     abyss → sand → grass → steppe → rock (cliffs darken with slope)
+     → snow caps (snow line drops toward the poles).
+   • THE SAME terrain recipe is implemented twice — once in GLSL for
+     the GPU, once in JS (an exact arithmetic port of the Ashima
+     simplex used by the shader) — so the physics collision surface IS
+     the rendered ground, and the collision radius adapts dynamically
+     to the tallest peak (visRadius + maxTerrain).
+   ===================================================================== */
+const TERRA_AMP_F = 0.05;      // mountain amplitude as a fraction of R
+
+// ---------- JS twin of the GLSL Ashima snoise (exact arithmetic port)
+function _taylorInv(r) { return 1.79284291400159 - 0.85373472095314 * r; }
+function _permute289(x) {
+  const y = ((x * 34 + 1) * x);
+  return y - Math.floor(y / 289) * 289;
+}
+function snoiseA(vx, vy, vz) {
+  const C = 1 / 6, C2 = 1 / 3;
+  const s = (vx + vy + vz) * C2;
+  let ix = Math.floor(vx + s), iy = Math.floor(vy + s), iz = Math.floor(vz + s);
+  const t = (ix + iy + iz) * C;
+  const x0 = vx - ix + t, y0 = vy - iy + t, z0 = vz - iz + t;
+  const gx = x0 >= y0 ? 1 : 0, gy = y0 >= z0 ? 1 : 0, gz = z0 >= x0 ? 1 : 0;
+  const lx = 1 - gx, ly = 1 - gy, lz = 1 - gz;
+  const i1x = Math.min(gx, lz), i1y = Math.min(gy, lx), i1z = Math.min(gz, ly);
+  const i2x = Math.max(gx, lz), i2y = Math.max(gy, lx), i2z = Math.max(gz, ly);
+  const xs = [x0, x0 - i1x + C, x0 - i2x + 2 * C, x0 - 1 + 3 * C];
+  const ys = [y0, y0 - i1y + C, y0 - i2y + 2 * C, y0 - 1 + 3 * C];
+  const zs = [z0, z0 - i1z + C, z0 - i2z + 2 * C, z0 - 1 + 3 * C];
+  ix -= Math.floor(ix / 289) * 289;
+  iy -= Math.floor(iy / 289) * 289;
+  iz -= Math.floor(iz / 289) * 289;
+  const jx = [0, i1x, i2x, 1], jy = [0, i1y, i2y, 1], jz = [0, i1z, i2z, 1];
+  const nsx = 2 / 7, nsy = 0.5 / 7 - 1, nsz = 1 / 7;
+  let n = 0;
+  for (let k = 0; k < 4; k++) {
+    let p = _permute289(iz + jz[k]);
+    p = _permute289(p + iy + jy[k]);
+    p = _permute289(p + ix + jx[k]);
+    const j = p - 49 * Math.floor(p * nsz * nsz);
+    const x_ = Math.floor(j * nsz);
+    const y_ = Math.floor(j - 7 * x_);
+    let gxk = x_ * nsx + nsy;
+    let gyk = y_ * nsx + nsy;
+    const ghk = 1 - Math.abs(gxk) - Math.abs(gyk);
+    const sh = ghk <= 0 ? -1 : 0;               // -step(h, 0)
+    gxk += (Math.floor(gxk) * 2 + 1) * sh;
+    gyk += (Math.floor(gyk) * 2 + 1) * sh;
+    const inv = _taylorInv(gxk * gxk + gyk * gyk + ghk * ghk);
+    let m = 0.6 - (xs[k] * xs[k] + ys[k] * ys[k] + zs[k] * zs[k]);
+    if (m < 0) m = 0;
+    m *= m;
+    n += m * m * (gxk * inv * xs[k] + gyk * inv * ys[k] + ghk * inv * zs[k]);
+  }
+  return 42 * n;
+}
+
+// ---------- shared terrain recipe (constants MUST match the GLSL) ----
+function tFbm(x, y, z, oct) {                    // mirrors GLSL fbm()
+  let a = 0.5, f = 1, s = 0;
+  for (let i = 0; i < oct; i++) {
+    s += a * snoiseA(x * f, y * f, z * f);
+    f *= 2.03; a *= 0.5;
+  }
+  return s;
+}
+function tRidged(x, y, z, oct) {                 // ridged multifractal
+  let a = 0.5, f = 1, w = 1, s = 0;
+  for (let i = 0; i < oct; i++) {
+    let n = 1 - Math.abs(snoiseA(x * f, y * f, z * f));
+    n *= n; n *= w;
+    s += n * a;
+    w = Math.min(1, Math.max(0, n * 2));
+    f *= 2.1; a *= 0.5;
+  }
+  return s;
+}
+function tBillow(x, y, z, oct) {                 // billow (rolling hills)
+  let a = 0.5, f = 1, s = 0;
+  for (let i = 0; i < oct; i++) {
+    s += a * (Math.abs(snoiseA(x * f, y * f, z * f)) * 2 - 1);
+    f *= 2.03; a *= 0.5;
+  }
+  return s;
+}
+// height in "amp units": ocean ≈ −0.35 … peaks ≈ +1.05
+function terraHeight(x, y, z) {
+  const cont = tFbm(x * 1.7 + 5.2, y * 1.7 + 5.2, z * 1.7 + 5.2, 6);
+  const land = _sstep(-0.02, 0.22, cont);
+  const mMask = _sstep(0.25, 0.65, tFbm(x * 2.4 + 11.7, y * 2.4 + 11.7, z * 2.4 + 11.7, 4));
+  const plains = (tBillow(x * 3.3 + 8.5, y * 3.3 + 8.5, z * 3.3 + 8.5, 4) * 0.5 + 0.5) * 0.16;
+  const mtn = tRidged(x * 4.3 + 3.1, y * 4.3 + 3.1, z * 4.3 + 3.1, 5);
+  const hLand = 0.05 + plains + mtn * 0.85 * mMask;
+  const ocean = cont * 0.5 - 0.18;
+  return ocean + (hLand - ocean) * land;         // mix(ocean, hLand, land)
+}
+function _sstep(a, b, x) {
+  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+// ---------- GLSL side: identical recipe + biome shading ---------------
+const TERRA_GLSL_VERT = GLSL_NOISE + `
+uniform float uTerraR;
+uniform float uTerraAmp;
+varying float vTerraH;
+varying float vTerraSlope;
+varying vec3 vTerraDir;
+float tRidged(vec3 p, int oct){
+  float a = 0.5, f = 1.0, w = 1.0, s = 0.0;
+  for (int i = 0; i < 5; i++) {
+    if (i >= oct) break;
+    float n = 1.0 - abs(snoise(p * f));
+    n *= n; n *= w;
+    s += n * a;
+    w = clamp(n * 2.0, 0.0, 1.0);
+    f *= 2.1; a *= 0.5;
+  }
+  return s;
+}
+float tBillow(vec3 p, int oct){
+  float a = 0.5, f = 1.0, s = 0.0;
+  for (int i = 0; i < 4; i++) {
+    if (i >= oct) break;
+    s += a * (abs(snoise(p * f)) * 2.0 - 1.0);
+    f *= 2.03; a *= 0.5;
+  }
+  return s;
+}
+float terrainH(vec3 p){          // EXACT twin of terraHeight() in JS
+  float cont = fbm(p * 1.7 + vec3(5.2), 6);
+  float land = smoothstep(-0.02, 0.22, cont);
+  float mMask = smoothstep(0.25, 0.65, fbm(p * 2.4 + vec3(11.7), 4));
+  float plains = (tBillow(p * 3.3 + vec3(8.5), 4) * 0.5 + 0.5) * 0.16;
+  float mtn = tRidged(p * 4.3 + vec3(3.1), 5);
+  float hLand = 0.05 + plains + mtn * 0.85 * mMask;
+  float ocean = cont * 0.5 - 0.18;
+  return mix(ocean, hLand, land);
+}
+float terrainHLow(vec3 p){       // cheaper gradient probe for normals
+  float cont = fbm(p * 1.7 + vec3(5.2), 4);
+  float land = smoothstep(-0.02, 0.22, cont);
+  float mMask = smoothstep(0.25, 0.65, fbm(p * 2.4 + vec3(11.7), 3));
+  float plains = (tBillow(p * 3.3 + vec3(8.5), 3) * 0.5 + 0.5) * 0.16;
+  float mtn = tRidged(p * 4.3 + vec3(3.1), 4);
+  float hLand = 0.05 + plains + mtn * 0.85 * mMask;
+  float ocean = cont * 0.5 - 0.18;
+  return mix(ocean, hLand, land);
+}`;
+
+const TERRA_GLSL_FRAG = `
+varying float vTerraH;
+varying float vTerraSlope;
+varying vec3 vTerraDir;`;
+
+// biome colour = f(height, slope, latitude)
+const TERRA_BIOME = `
+{
+  float hw = vTerraH;
+  float lat = abs(vTerraDir.y);
+  vec3 col;
+  if (hw <= 0.0) {
+    // sea floor: abyssal navy shading to shore sand (mostly under water)
+    col = mix(vec3(0.045, 0.115, 0.22), vec3(0.76, 0.70, 0.50),
+              smoothstep(-0.07, 0.0, hw));
+  } else {
+    vec3 sand   = vec3(0.78, 0.71, 0.52);
+    vec3 grass  = vec3(0.20, 0.41, 0.16);
+    vec3 steppe = vec3(0.44, 0.46, 0.21);
+    vec3 rock   = vec3(0.41, 0.39, 0.37);
+    vec3 snow   = vec3(0.93, 0.95, 0.97);
+    col = mix(sand, grass, smoothstep(0.012, 0.06, hw));
+    col = mix(col, steppe, smoothstep(0.13, 0.30, hw));
+    col = mix(col, rock,   smoothstep(0.32, 0.55, hw));
+    // snow line descends toward the poles; steep faces shed their snow
+    float snowLine = 0.60 - lat * 0.45;
+    float snowAmt = smoothstep(snowLine, snowLine + 0.12, hw)
+                  * (1.0 - smoothstep(0.35, 0.75, vTerraSlope));
+    snowAmt = max(snowAmt, smoothstep(0.86, 0.93, lat));   // polar caps
+    col = mix(col, snow, snowAmt);
+    // slope shading: cliff faces read as dark bare rock
+    col = mix(col, rock * 0.55, smoothstep(0.45, 0.80, vTerraSlope));
+  }
+  diffuseColor.rgb = col;
+}`;
+
+// ---------- spherified cube geometry ----------------------------------
+function buildQuadSphere(R, res) {
+  const verts = [];
+  const faces = [
+    { u: [ 1, 0, 0], v: [0, 1,  0], w: [ 0,  0,  1] },
+    { u: [-1, 0, 0], v: [0, 1,  0], w: [ 0,  0, -1] },
+    { u: [ 0, 0,-1], v: [0, 1,  0], w: [ 1,  0,  0] },
+    { u: [ 0, 0, 1], v: [0, 1,  0], w: [-1,  0,  0] },
+    { u: [ 1, 0, 0], v: [0, 0, -1], w: [ 0,  1,  0] },
+    { u: [ 1, 0, 0], v: [0, 0,  1], w: [ 0, -1,  0] }
+  ];
+  const idx = [];
+  for (let f = 0; f < 6; f++) {
+    const F = faces[f], base = verts.length / 3;
+    for (let j = 0; j <= res; j++) {
+      for (let i = 0; i <= res; i++) {
+        const a = (i / res) * 2 - 1, b = (j / res) * 2 - 1;
+        const cx = F.u[0] * a + F.v[0] * b + F.w[0];
+        const cy = F.u[1] * a + F.v[1] * b + F.w[1];
+        const cz = F.u[2] * a + F.v[2] * b + F.w[2];
+        // spherified-cube map: uniform cells, no polar pinch
+        const x2 = cx * cx, y2 = cy * cy, z2 = cz * cz;
+        const sx = cx * Math.sqrt(1 - y2 / 2 - z2 / 2 + (y2 * z2) / 3);
+        const sy = cy * Math.sqrt(1 - z2 / 2 - x2 / 2 + (z2 * x2) / 3);
+        const sz = cz * Math.sqrt(1 - x2 / 2 - y2 / 2 + (x2 * y2) / 3);
+        verts.push(sx * R, sy * R, sz * R);
+      }
+    }
+    // face triangles — winding auto-corrected to point outward
+    const fi = [];
+    for (let j = 0; j < res; j++) {
+      for (let i = 0; i < res; i++) {
+        const a0 = base + j * (res + 1) + i, a1 = a0 + 1;
+        const b0 = a0 + res + 1, b1 = b0 + 1;
+        fi.push(a0, b0, a1, a1, b0, b1);
+      }
+    }
+    const A = fi[0] * 3, B = fi[1] * 3, Cc = fi[2] * 3;
+    const e1 = [verts[B]-verts[A], verts[B+1]-verts[A+1], verts[B+2]-verts[A+2]];
+    const e2 = [verts[Cc]-verts[A], verts[Cc+1]-verts[A+1], verts[Cc+2]-verts[A+2]];
+    const nx = e1[1]*e2[2]-e1[2]*e2[1], ny = e1[2]*e2[0]-e1[0]*e2[2], nz = e1[0]*e2[1]-e1[1]*e2[0];
+    const outward = nx*verts[A] + ny*verts[A+1] + nz*verts[A+2];
+    if (outward < 0) for (let k = 0; k < fi.length; k += 3) { const t = fi[k+1]; fi[k+1] = fi[k+2]; fi[k+2] = t; }
+    idx.push(...fi);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
+  const nrm = new Float32Array(verts.length);
+  for (let k = 0; k < verts.length; k += 3) {
+    const l = Math.hypot(verts[k], verts[k+1], verts[k+2]) || 1;
+    nrm[k] = verts[k] / l; nrm[k+1] = verts[k+1] / l; nrm[k+2] = verts[k+2] / l;
+  }
+  geo.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  geo.setIndex(idx);
+  geo.computeBoundingSphere();
+  if (geo.boundingSphere) geo.boundingSphere.radius *= 1 + TERRA_AMP_F * 1.3;
+  return geo;
+}
+
+// ---------- terra mesh + GPU displacement material --------------------
+function buildTerraMesh(cfg) {
+  const r = cfg.visRadius;
+  const amp = r * TERRA_AMP_F;
+  const geo = buildQuadSphere(r, 80);          // 6×80² ≈ 77k tris
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.93, metalness: 0.02 });
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.uTerraR = { value: r };
+    shader.uniforms.uTerraAmp = { value: amp };
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\n' + TERRA_GLSL_VERT)
+      .replace('#include <beginnormal_vertex>',
+`#include <beginnormal_vertex>
+{
+  vec3 dirN = normalize(position);
+  float e = 0.0035;
+  vec3 tA = normalize(abs(dirN.y) < 0.99 ? cross(dirN, vec3(0.0, 1.0, 0.0)) : vec3(1.0, 0.0, 0.0));
+  vec3 tB = normalize(cross(dirN, tA));
+  float h0 = terrainH(dirN);
+  float hA = terrainHLow(normalize(dirN + tA * e));
+  float hB = terrainHLow(normalize(dirN + tB * e));
+  vec3 p0 = dirN * (uTerraR + h0 * uTerraAmp);
+  vec3 pA = normalize(dirN + tA * e) * (uTerraR + hA * uTerraAmp);
+  vec3 pB = normalize(dirN + tB * e) * (uTerraR + hB * uTerraAmp);
+  objectNormal = normalize(cross(pA - p0, pB - p0));
+  if (dot(objectNormal, dirN) < 0.0) objectNormal = -objectNormal;
+  vTerraH = h0;
+  vTerraDir = dirN;
+  vTerraSlope = clamp(1.0 - dot(objectNormal, dirN), 0.0, 1.0);
+}`)
+      .replace('#include <begin_vertex>',
+`#include <begin_vertex>
+transformed = normalize(position) * (uTerraR + vTerraH * uTerraAmp);`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\n' + TERRA_GLSL_FRAG)
+      .replace('#include <color_fragment>', '#include <color_fragment>\n' + TERRA_BIOME);
+  };
+  const mesh = new THREE.Mesh(geo, mat);
+  // physics twin: sea level clamps the walkable surface at h = 0
+  mesh.userData.surfaceFn = (d) => r + Math.max(terraHeight(d.x, d.y, d.z), 0) * amp;
+  // specular ocean sphere exactly at sea level — sun-glint water
+  const ocean = new THREE.Mesh(
+    new THREE.SphereGeometry(r, 72, 48),
+    new THREE.MeshPhongMaterial({
+      color: 0x11406f, specular: 0xaaccee, shininess: 130
+    }));
+  mesh.add(ocean);
+  return mesh;
+}
+
 function addBody(cfg) {
   const group = new THREE.Group();
   let mesh, gasMat = null, cloudMesh = null;
@@ -1025,6 +1331,9 @@ function addBody(cfg) {
       ring.rotation.x = Math.PI / 2 + (cfg.rings.tilt || 0);
       group.add(ring);
     }
+  } else if (cfg.type === 'terra') {
+    mesh = buildTerraMesh(cfg);
+    group.add(mesh);
   } else {
     mesh = buildRockyMesh(cfg);
     group.add(mesh);
@@ -1064,6 +1373,11 @@ function addBody(cfg) {
     _atmoMat: cfg._atmoMat || null
   };
   mesh.rotation.z = body.axialTilt;
+  // Dynamic collision reach = tallest possible terrain feature. The
+  // broad-phase gate opens exactly at (visRadius + maxTerrain), so the
+  // narrow-phase height query engages only when truly skimming ground.
+  if (cfg.type === 'terra')      body.maxTerrain = cfg.visRadius * TERRA_AMP_F * 1.2;
+  else if (cfg.type === 'rocky') body.maxTerrain = cfg.amp * cfg.visRadius * 1.2;
   // Terrain-accurate surface radius at a world position. Stars & gas
   // giants fall back to their sphere radius (their "surface" IS smooth).
   body.surfaceRadius = function (worldPos) {
@@ -1131,12 +1445,12 @@ function buildSolarSystem() {
             grav: '8.87 m/s²', temp: '462 °C', press: '92 bar',
             atmo: [['CO₂', 96.5], ['N₂', 3.5]] } });
 
-  // ---- EARTH: green/tan continents, specular ocean, drifting clouds ----
-  const earth = P({ name: 'Earth', type: 'rocky', visRadius: logRadius(6371),
-    seed: 33, freq: 2.2, amp: 0.05, ridged: 0.8, craters: 0,
-    ocean: { level: 0.02, color: 0x123f75, shininess: 120 },  // sun-glint sea
-    palette: [{h:0,c:0x2f6b31},{h:0.55,c:0x6f8a3a},{h:0.7,c:0x9c7a4a},{h:0.86,c:0x8f8d85},{h:1,c:0xffffff}],
-    iceCaps: 0.88, surfaceG: 9.81, spin: 0.03, axialTilt: 23.4 * D2R,
+  // ---- EARTH — TERRA flagship: spherified-cube grid, GPU-displaced
+  //      layered fBm + ridged mountains + billow plains, height/slope
+  //      biomes, snow line by latitude, specular sea. Physics collides
+  //      with this exact terrain via the JS noise twin. ----
+  const earth = P({ name: 'Earth', type: 'terra', visRadius: logRadius(6371),
+    surfaceG: 9.81, spin: 0.03, axialTilt: 23.4 * D2R,
     orbit: els(1.496e8, 1.0, 0.0167, 0.0, 200),
     clouds: { height: 1.03, colA: 0xffffff, colB: 0x9fb2c8,
               cover: 0.42, scale: 3.0, speed: 0.012 },       // slow white layer
@@ -1826,7 +2140,8 @@ function physicsStep(dt) {
       // (mountain peak, valley floor or ocean), never an invisible
       // shell hovering above it. The cheap analytic height query only
       // runs when the ship is already skimming the planet.
-      if (r < b.visRadius * 1.12 + 3) {
+      const reach = b.maxTerrain !== undefined ? b.maxTerrain : b.visRadius * 0.12;
+      if (r < b.visRadius + reach + 3) {
         const surfR = b.surfaceRadius(ship.pos);
         if (r < surfR + 0.9) {
           const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
@@ -1882,7 +2197,8 @@ function physicsStep(dt) {
     if (gbd && gbd.type !== 'star') {
       _tmpV.copy(ship.pos).sub(gbd.position);
       const dg = _tmpV.length();
-      if (dg < gbd.visRadius * 1.12 + 48) {
+      const reachG = gbd.maxTerrain !== undefined ? gbd.maxTerrain : gbd.visRadius * 0.12;
+      if (dg < gbd.visRadius + reachG + 48) {
         _tmpV.divideScalar(dg);                       // radial "up"
         const alt = dg - gbd.surfaceRadius(ship.pos);
         if (alt < 45) {

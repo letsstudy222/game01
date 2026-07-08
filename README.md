@@ -53,6 +53,21 @@ No build step, no server required.
   mountain ridges, and touch down on the actual ground. Idling below
   45 u altitude engages a gentle 6 u/s glide that lands the ship itself.
 
+## Terra Earth — flagship realistic terrain
+- **Spherified-cube mesh** (6 warped cube faces, ~77k tris): uniform
+  triangle density with zero polar pinching artifacts.
+- **GPU vertex-shader displacement**: layered 6-octave fBm continents,
+  ridged-multifractal mountain chains, billow-noise rolling plains —
+  normals rebuilt per-vertex from the height-field gradient so
+  MeshStandardMaterial lights every ridge and valley correctly.
+- **Height + slope biomes** in the fragment shader: abyss → sand →
+  grass → steppe → bare rock (cliffs darken with slope) → snow, with a
+  snow line that descends toward the poles; specular sea at sea level.
+- **One terrain recipe, two runtimes**: the exact Ashima-simplex
+  arithmetic runs in GLSL for rendering and in JavaScript for physics,
+  so the collision surface IS the rendered ground, and the collision
+  reach adapts to the tallest peak (visRadius + maxTerrain).
+
 ## What's inside
 - **Kepler orbital mechanics** — real orbital elements (a, e, i) for all 8 planets
   and major moons; Kepler's equation solved per frame with Newton–Raphson;
