@@ -523,6 +523,41 @@ function initPost() {
 }
 
 
+// Procedural water normal map (canvas, no external files): the ocean
+// must read as WATER at touchdown range, not as a smooth plastic shell.
+function makeWaterNormalTexture() {
+  const S = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d');
+  const img = ctx.createImageData ? ctx.createImageData(S, S) : null;
+  if (!img) return new THREE.CanvasTexture(c);
+  const sx = new SimplexNoise(2024);
+  const h = new Float32Array(S * S);
+  for (let y = 0; y < S; y++)
+    for (let x = 0; x < S; x++)
+      h[y * S + x] = fbm(sx, x * 0.035, y * 0.035, 0, 4, 2.1, 0.5)
+                   + fbm(sx, x * 0.11, y * 0.11, 7, 3, 2.1, 0.5) * 0.4;
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      const xm = (x - 1 + S) % S, xp = (x + 1) % S;
+      const ym = (y - 1 + S) % S, yp = (y + 1) % S;
+      const nx = (h[y * S + xm] - h[y * S + xp]) * 2.2;
+      const ny = (h[ym * S + x] - h[yp * S + x]) * 2.2;
+      const i = (y * S + x) * 4;
+      img.data[i]   = Math.max(0, Math.min(255, 128 + nx * 127));
+      img.data[i+1] = Math.max(0, Math.min(255, 128 + ny * 127));
+      img.data[i+2] = 255;
+      img.data[i+3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.wrapS = tex.wrapT = THREE.MirroredRepeatWrapping;
+  tex.repeat.set(10, 5);
+  return tex;
+}
+
 function makeGlowTexture(inner, outer) {
   const c = document.createElement('canvas');
   c.width = c.height = 128;
@@ -1257,14 +1292,198 @@ transformed = normalize(position) * (uTerraR + aHeight * uTerraAmp);`);
   const mesh = new THREE.Mesh(geo, mat);
   // physics twin: sea level clamps the walkable surface at h = 0
   mesh.userData.surfaceFn = (d) => r + Math.max(terraHeight(d.x, d.y, d.z), 0) * amp;
-  // specular ocean sphere exactly at sea level — sun-glint water
+  // specular ocean sphere exactly at sea level — animated water so a
+  // touchdown at sea reads as OCEAN, never as a smooth "outer shell"
+  const waterTex = makeWaterNormalTexture();
   const ocean = new THREE.Mesh(
     new THREE.SphereGeometry(r, 72, 48),
     new THREE.MeshPhongMaterial({
-      color: 0x11406f, specular: 0xaaccee, shininess: 130
+      color: 0x16528c, specular: 0x9fcaf0, shininess: 95,
+      normalMap: waterTex,
+      normalScale: new THREE.Vector2(0.45, 0.45)
     }));
   mesh.add(ocean);
+  mesh.userData.oceanTex = waterTex;
+  mesh.userData.ocean = ocean;
+  // voxel root: child of the ROTATING mesh, so blocks spin with the
+  // planet and live in the same local space as terraHeight sampling
+  const voxelRoot = new THREE.Group();
+  voxelRoot.visible = false;
+  mesh.add(voxelRoot);
+  mesh.userData.voxelRoot = voxelRoot;
   return mesh;
+}
+
+
+/* =====================================================================
+   5c. VOXEL LOD — Minecraft-style close-range terrain for Earth
+   ---------------------------------------------------------------------
+   • DIST > 60 u  : the smooth Terra sphere renders (cheap, far LOD).
+   • DIST ≤ 50 u  : the sphere (and its ocean) are hidden and the same
+     terrain re-materialises as UNIT CUBES streamed in 8×8×8 chunks
+     around the ship (InstancedMesh, flat-shaded, tiered colours:
+     grass top → dirt → stone, water tops on ocean columns, snow caps).
+   • ONE function — columnTop(dir) = round-quantised noise height —
+     decides BOTH which cubes exist AND where the physics surface is,
+     so the ship collides with the first visible voxel face and with
+     absolutely nothing before it. The atmosphere is a pure visual/drag
+     layer: you fly straight through it; LANDED can only trigger on
+     block contact.
+   ===================================================================== */
+const VOX_CHUNK = 8;          // blocks per chunk edge (8×8×8)
+const VOX_HSCALE = 16;        // vertical exaggeration: h(0..0.6) → 0..10 blocks
+const VOX_ENTER = 50;         // DIST (to centre) at which voxels engage
+const VOX_EXIT = 60;          // hysteresis: back to the sphere beyond this
+const VOX_LOAD_R = 34;        // stream chunks within this range of the ship
+const VOX_EVICT_R = 48;
+
+const _voxDummy = new THREE.Object3D();
+const _voxColor = new THREE.Color();
+const _voxDir = new THREE.Vector3();
+const _voxQ = new THREE.Quaternion();
+const _voxLocal = new THREE.Vector3();
+
+// ONE lattice, ONE truth: every unit cell (integer coords) is classified
+// once — by sampling the noise at ITS OWN centre — and memoised forever
+// (the terrain is static). Renderer, collision, resolver and HUD all ask
+// the same cell table, so a point in space has exactly one answer and
+// there are no secondary-grid boundary flickers.
+function voxCellInfo(v, ix, iy, iz) {
+  const k = ix + ',' + iy + ',' + iz;
+  let info = v.cellMemo.get(k);
+  if (info === undefined) {
+    const cx = ix + 0.5, cy = iy + 0.5, cz = iz + 0.5;
+    const d = Math.hypot(cx, cy, cz);
+    if (d < 1e-4) {
+      info = { solid: 1, top: v.baseR, land: 0, d };
+    } else {
+      const h = terraHeight(cx / d, cy / d, cz / d);
+      const top = v.baseR + Math.round(Math.max(h, 0) * VOX_HSCALE);
+      info = { solid: d <= top + 1e-4 ? 1 : 0, top, land: h > 0 ? 1 : 0, d };
+    }
+    v.cellMemo.set(k, info);
+  }
+  return info;
+}
+// is the unit CELL containing point (x,y,z) solid?
+function voxSolidAt(v, x, y, z) {
+  return voxCellInfo(v, Math.floor(x), Math.floor(y), Math.floor(z)).solid === 1;
+}
+
+// climb outward along the local radial until the ship's "feet" point
+// (0.6 below its centre) sits in an AIR cell — rest ON the first cube.
+function resolveVoxelRest(v, ldx, ldy, ldz, startR) {
+  let t = Math.max(startR, v.baseR - 2);
+  const tMax = v.baseR + v.maxTop + 4;
+  while (t < tMax) {
+    const fr = t - 0.6;
+    if (!voxSolidAt(v, ldx * fr, ldy * fr, ldz * fr)) return t;
+    t += 0.12;
+  }
+  return tMax;
+}
+
+function buildVoxelChunk(v, cx, cy, cz) {
+  const S = VOX_CHUNK;
+  const items = [];
+  for (let iz = 0; iz < S; iz++) for (let iy = 0; iy < S; iy++) for (let ix = 0; ix < S; ix++) {
+    const IX = cx * S + ix, IY = cy * S + iy, IZ = cz * S + iz;
+    const X = IX + 0.5, Y = IY + 0.5, Z = IZ + 0.5;
+    const dApprox = Math.hypot(X, Y, Z);
+    if (dApprox < v.baseR - 9 || dApprox > v.baseR + v.maxTop + 1.5) continue;
+    const c = voxCellInfo(v, IX, IY, IZ);
+    if (!c.solid) continue;
+    // render only cubes with at least one air neighbour
+    const exposed =
+      !voxCellInfo(v, IX + 1, IY, IZ).solid || !voxCellInfo(v, IX - 1, IY, IZ).solid ||
+      !voxCellInfo(v, IX, IY + 1, IZ).solid || !voxCellInfo(v, IX, IY - 1, IZ).solid ||
+      !voxCellInfo(v, IX, IY, IZ + 1).solid || !voxCellInfo(v, IX, IY, IZ - 1).solid;
+    if (!exposed) continue;
+    // tiered block colouring by depth under this cell's own column top
+    const depth = c.top - c.d;
+    let col;
+    if (depth < 0.75) {
+      if (!c.land) col = 0x3a72c8;                       // water surface
+      else if (Math.abs(Y / c.d) > 0.86) col = 0xe8eef2; // polar snow
+      else col = 0x4f9c3c;                               // grass
+    } else if (depth < 2.6) {
+      col = c.land ? 0x8d6239 : 0xc9b47a;                // dirt / seabed
+    } else {
+      col = 0x7d7d7d;                                    // stone
+    }
+    items.push([X, Y, Z, col]);
+  }
+  if (items.length === 0) return null;
+  const mesh = new THREE.InstancedMesh(v.blockGeo, v.blockMat, items.length);
+  for (let i = 0; i < items.length; i++) {
+    _voxDummy.position.set(items[i][0], items[i][1], items[i][2]);
+    _voxDummy.updateMatrix();
+    mesh.setMatrixAt(i, _voxDummy.matrix);
+    mesh.setColorAt(i, _voxColor.setHex(items[i][3]));
+  }
+  if (mesh.instanceMatrix) mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.frustumCulled = true;
+  return mesh;
+}
+
+// per-frame LOD + chunk streaming (throttled by the caller)
+function voxelUpdate(body) {
+  const v = body._vox;
+  if (!v) return;
+  const distC = ship.pos.distanceTo(body.position);
+  // hysteresis toggle
+  if (!v.active && distC <= VOX_ENTER) v.active = true;
+  else if (v.active && distC > VOX_EXIT) v.active = false;
+  const showVox = v.active;
+  if (body.mesh.material) body.mesh.material.visible = !showVox;   // sphere off,
+  if (body.mesh.userData.ocean) body.mesh.userData.ocean.visible = !showVox; // kids stay
+  v.root.visible = showVox;
+  if (!showVox) {
+    if (v.chunks.size && distC > VOX_EXIT * 2) {   // fully left: free memory
+      for (const m of v.chunks.values()) { v.root.remove(m); m.dispose && m.dispose(); }
+      v.chunks.clear(); v.queue.length = 0;
+    }
+    return;
+  }
+  // ship position in the planet's rotating LOCAL space
+  body.mesh.getWorldQuaternion(_voxQ).invert();
+  _voxLocal.copy(ship.pos).sub(body.position).applyQuaternion(_voxQ);
+  const S = VOX_CHUNK;
+  const c0x = Math.floor(_voxLocal.x / S), c0y = Math.floor(_voxLocal.y / S), c0z = Math.floor(_voxLocal.z / S);
+  const RC = Math.ceil(VOX_LOAD_R / S);
+  // enqueue missing chunks (nearest first)
+  const wanted = [];
+  for (let dz = -RC; dz <= RC; dz++) for (let dy = -RC; dy <= RC; dy++) for (let dx = -RC; dx <= RC; dx++) {
+    const cx = c0x + dx, cy = c0y + dy, cz = c0z + dz;
+    const ccx = (cx + 0.5) * S, ccy = (cy + 0.5) * S, ccz = (cz + 0.5) * S;
+    const dShip = Math.hypot(ccx - _voxLocal.x, ccy - _voxLocal.y, ccz - _voxLocal.z);
+    if (dShip > VOX_LOAD_R) continue;
+    const dCore = Math.hypot(ccx, ccy, ccz);
+    if (dCore < v.baseR - 12 || dCore > v.baseR + v.maxTop + 8) continue;  // off-shell
+    const key = cx + ',' + cy + ',' + cz;
+    if (!v.chunks.has(key)) wanted.push([dShip, key, cx, cy, cz]);
+  }
+  wanted.sort((a, b) => a[0] - b[0]);
+  v.queue = wanted;
+  // build a few chunks per frame — streaming stays under the 60 FPS budget
+  let budget = 2;
+  while (budget-- > 0 && v.queue.length) {
+    const [, key, cx, cy, cz] = v.queue.shift();
+    if (v.chunks.has(key)) continue;
+    const m = buildVoxelChunk(v, cx, cy, cz);
+    v.chunks.set(key, m || false);            // false = known-empty chunk
+    if (m) v.root.add(m);
+  }
+  // evict far chunks
+  for (const [key, m] of v.chunks) {
+    const [cx, cy, cz] = key.split(',').map(Number);
+    const dShip = Math.hypot((cx + 0.5) * S - _voxLocal.x, (cy + 0.5) * S - _voxLocal.y, (cz + 0.5) * S - _voxLocal.z);
+    if (dShip > VOX_EVICT_R) {
+      if (m) { v.root.remove(m); m.dispose && m.dispose(); }
+      v.chunks.delete(key);
+    }
+  }
 }
 
 function addBody(cfg) {
@@ -1357,7 +1576,26 @@ function addBody(cfg) {
   // Dynamic collision reach = tallest possible terrain feature. The
   // broad-phase gate opens exactly at (visRadius + maxTerrain), so the
   // narrow-phase height query engages only when truly skimming ground.
-  if (cfg.type === 'terra')      body.maxTerrain = cfg.visRadius * TERRA_AMP_F * 1.2;
+  if (cfg.type === 'terra') {
+    body.maxTerrain = cfg.visRadius * TERRA_AMP_F * 1.2;
+    const baseR = Math.round(cfg.visRadius);
+    body._vox = {
+      active: false,
+      baseR,
+      maxTop: Math.ceil(0.65 * VOX_HSCALE),          // tallest column (blocks)
+      root: mesh.userData.voxelRoot,
+      chunks: new Map(),
+      queue: [],
+      cellMemo: new Map(),
+      blockGeo: new THREE.BoxGeometry(1, 1, 1),
+      blockMat: new THREE.MeshStandardMaterial({
+        flatShading: true, roughness: 0.95, metalness: 0.0
+      })
+    };
+    // in voxel mode the collision reach must cover the taller stepped
+    // relief (VOX_HSCALE blocks ≫ the smooth-sphere amplitude)
+    body.maxTerrain = Math.max(body.maxTerrain, body._vox.maxTop + 1.5);
+  }
   else if (cfg.type === 'rocky') body.maxTerrain = cfg.amp * cfg.visRadius * 1.2;
   // Terrain-accurate surface radius at a world position. Stars & gas
   // giants fall back to their sphere radius (their "surface" IS smooth).
@@ -1367,6 +1605,19 @@ function addBody(cfg) {
     _sfDir.copy(worldPos).sub(this.position).normalize();
     mesh.getWorldQuaternion(_sfQ).invert();
     _sfDir.applyQuaternion(_sfQ);          // into rotating mesh space
+    // voxel LOD engaged: the physics surface is the OUTER FACE of the
+    // top cube of this column — driven by the very same voxCellInfo
+    // that placed the rendered cubes. Contact happens on the first
+    // visible block and nowhere above it.
+    if (this._vox && this._vox.active) {
+      // approximate cube-top along this radial (HUD/flare use only —
+      // real contact is decided by voxSolidAt on the ship's feet cell)
+      const v = this._vox;
+      let t = v.baseR + v.maxTop + 1;
+      while (t > v.baseR - 2 &&
+             !voxSolidAt(v, _sfDir.x * t, _sfDir.y * t, _sfDir.z * t)) t -= 0.5;
+      return t + 0.5;
+    }
     return f(_sfDir);
   };
   bodies.push(body);
@@ -2025,8 +2276,24 @@ function physicsStep(dt) {
     const b = ship.landedOn;
     _tmpV.copy(ship.landLocal).applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()));
     _tmpV.normalize();
-    _tmpV2.copy(b.position).addScaledVector(_tmpV, b.visRadius + 5);
-    ship.pos.copy(b.position).addScaledVector(_tmpV, b.surfaceRadius(_tmpV2) + 0.6);
+    let rideR;
+    if (b._vox && b._vox.active) {
+      b.mesh.getWorldQuaternion(_sfQ).invert();
+      _voxDir.copy(_tmpV).applyQuaternion(_sfQ);
+      rideR = resolveVoxelRest(b._vox, _voxDir.x, _voxDir.y, _voxDir.z,
+                               ship.landLocal.length());
+    } else {
+      _tmpV2.copy(b.position).addScaledVector(_tmpV, b.visRadius + 5);
+      rideR = b.surfaceRadius(_tmpV2) + 0.6;
+    }
+    ship.pos.copy(b.position).addScaledVector(_tmpV, rideR);
+    const sRland = rideR - 0.6;
+    // tell the pilot WHAT they are parked on — a sea-level touchdown on
+    // the ocean is real surface contact, not a barrier
+    const onWater = b.type === 'terra' && sRland <= b.visRadius + 1e-4;
+    ui.fLand.textContent = onWater
+      ? 'LANDED ON OCEAN — REFUELING'
+      : 'LANDED — REFUELING';
     ship.vel.copy(b.velocity);
     ship.fuel = Math.min(100, ship.fuel + 6 * dt);
     ship.hull = Math.min(100, ship.hull + 2 * dt);
@@ -2125,25 +2392,59 @@ function physicsStep(dt) {
       // runs when the ship is already skimming the planet.
       const reach = b.maxTerrain !== undefined ? b.maxTerrain : b.visRadius * 0.12;
       if (r < b.visRadius + reach + 3) {
-        const surfR = b.surfaceRadius(ship.pos);
-        // contact EXACTLY at the terrain: base radius + noise height
-        // (+0.6 = the physical half-height of the hull, not padding)
-        if (r <= surfR + 0.6) {
+        // ---- narrow phase ------------------------------------------
+        // VOXEL mode: contact is decided by the very cell test that
+        // placed the cubes — the ship's feet point (0.6 under centre,
+        // plus a swept midpoint sample against tunnelling) must sit
+        // inside a solid cube. Nothing above the first visible block
+        // face can ever register a hit.
+        const isVox = b._vox && b._vox.active;
+        let contact = false, restR = 0;
+        if (isVox) {
+          b.mesh.getWorldQuaternion(_sfQ).invert();
+          _voxLocal.copy(ship.pos).sub(b.position).applyQuaternion(_sfQ);
+          const lr = _voxLocal.length();
+          _voxDir.copy(_voxLocal).divideScalar(lr);
+          const fr = lr - 0.6;
+          contact = voxSolidAt(b._vox, _voxDir.x * fr, _voxDir.y * fr, _voxDir.z * fr);
+          if (!contact) {                    // swept midpoint (anti-tunnel)
+            _tmpV2.copy(ship.vel).sub(b.velocity);
+            const back = _tmpV2.length() * dt * 0.5;
+            if (back > 0.3) {
+              const fr2 = fr + back;         // approximate previous radial
+              contact = voxSolidAt(b._vox, _voxDir.x * fr2, _voxDir.y * fr2, _voxDir.z * fr2)
+                        && fr2 < b._vox.baseR + b._vox.maxTop + 1;
+            }
+          }
+          if (contact) restR = resolveVoxelRest(b._vox, _voxDir.x, _voxDir.y, _voxDir.z, lr);
+        } else {
+          const surfR = b.surfaceRadius(ship.pos);
+          contact = r <= surfR + 0.6;        // exact terrain + hull height
+          restR = surfR + 0.8;
+        }
+        if (contact) {
           const relV = _tmpV2.copy(ship.vel).sub(b.velocity);
           const speed = relV.length();
           if (b.type === 'star') { damage(200 * dt + 50); }
           else if (speed <= SAFE_LANDING_V) {
             ship.landedOn = b;
             ship.warpDrive = false;
+            ship.vel.copy(b.velocity);       // lock to the planet's frame NOW
             ship.landLocal.copy(ship.pos).sub(b.position)
               .applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
+            if (isVox) {                     // settle exactly on the cube face
+              const n = _tmpV.copy(ship.pos).sub(b.position).normalize();
+              ship.pos.copy(b.position).addScaledVector(n, restR);
+              ship.landLocal.copy(ship.pos).sub(b.position)
+                .applyQuaternion(b.mesh.getWorldQuaternion(new THREE.Quaternion()).invert());
+            }
           } else {
             damage((speed - SAFE_LANDING_V) * 1.6);
             const n = _tmpV.copy(ship.pos).sub(b.position).normalize();
             const vn = relV.dot(n);
             relV.addScaledVector(n, -1.7 * vn);
             ship.vel.copy(b.velocity).addScaledVector(relV, 0.55);
-            ship.pos.copy(b.position).addScaledVector(n, surfR + 0.8);
+            ship.pos.copy(b.position).addScaledVector(n, isVox ? restR + 0.2 : restR);
           }
         }
       }
@@ -2151,6 +2452,15 @@ function physicsStep(dt) {
   }
   ui.grav.textContent = gPull.toFixed(2);
   if (gPull > 25) flashFlag('flag-warn', 0.3);
+
+  // just touched down inside this very step: freeze here — no damping,
+  // no drag, and crucially NO integration may move the settled ship
+  if (ship.landedOn) {
+    fx.relSpeed = 0; fx.relVel.set(0, 0, 0); fx.burn = 0; fx.turbo = 0;
+    ui.vignette.style.opacity = 0;
+    shipVisual.burn.material.opacity = 0;
+    return;
+  }
 
   // relative velocity in the local frame
   _relV.copy(ship.vel).sub(_refVel);
@@ -2303,6 +2613,8 @@ function updateBodies(dt) {
       b.gasMat.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
     }
     if (b.type === 'star') b.mesh.material.uniforms.uTime.value = perfTime;
+    const ot = b.mesh.userData && b.mesh.userData.oceanTex;
+    if (ot && ot.offset) { ot.offset.x += dt * 0.004; ot.offset.y += dt * 0.0016; }
     if (b._atmoMat) {
       b._atmoMat.uniforms.uSunPos.value.copy(systems[b.systemIndex].star.position);
       b._atmoMat.uniforms.uCenter.value.copy(b.position);
@@ -2388,6 +2700,7 @@ function updateHUD() {
 
 let frameCount = 0;
 let wasObserving = false;
+let voxTimer = 0;
 function animate() {
   requestAnimationFrame(animate);
   // THREE.Clock delta — ship speed identical on 30, 60 or 144 FPS rigs
@@ -2401,6 +2714,16 @@ function animate() {
 
   frameCount++;
   if (frameCount % 3 === 0) { updateHUD(); updateLabels(); }
+
+  // voxel LOD + chunk streaming for terra planets (throttled ~6.7 Hz;
+  // chunk BUILDS are additionally budgeted inside voxelUpdate)
+  voxTimer += dt;
+  if (voxTimer > 0.15) {
+    voxTimer = 0;
+    for (const b of bodies) {
+      if (b._vox && b.systemIndex === currentSystem) voxelUpdate(b);
+    }
+  }
 
   // leaving time-warp observation mode: velocities of the bodies are
   // sane again — re-anchor the ship to the local frame once, smoothly
@@ -2447,7 +2770,10 @@ function animate() {
     warpPass.uniforms.uAmount.value = fx.warp;
     gradePass.uniforms.uTime.value = perfTime;
     gradePass.uniforms.uWarp.value = fx.warp;
-    gradePass.uniforms.uAtmo.value = fx.atmoSm;
+    // ground view must stay readable: the immersion tint is mild when
+    // parked (sky haze) and only strengthens during an actual descent
+    gradePass.uniforms.uAtmo.value =
+      fx.atmoSm * (0.35 + 0.4 * THREE.MathUtils.clamp(fx.relSpeed / 100, 0, 1));
     gradePass.uniforms.uAtmoColor.value.copy(fx.atmoColor);
     composer.render();
   } else {
